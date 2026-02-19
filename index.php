@@ -326,6 +326,60 @@ function send_security_headers(bool $isJson): void {
 	}
 }
 
+// -------------------- Results summary (for JSON API) --------------------
+function build_results_summary(array $results, array $zones): array {
+	$ips = array_keys($results);
+	$totalIps = count($ips);
+	$totalZones = count($zones);
+	$totalChecks = $totalIps * $totalZones;
+	$totalListed = 0;
+	$listedIps = [];
+	$cleanIps = [];
+	$listedByIp = [];
+	$listedByZone = [];
+	foreach ($zones as $z) {
+		$listedByZone[$z] = ['count' => 0, 'ips' => []];
+	}
+
+	foreach ($results as $ip => $zoneRes) {
+		$ipZones = [];
+		foreach ($zones as $z) {
+			if (!isset($zoneRes[$z])) continue;
+			$entry = $zoneRes[$z];
+			if (!empty($entry['listed'])) {
+				$totalListed++;
+				$ipZones[] = $z;
+				$listedByZone[$z]['count']++;
+				$listedByZone[$z]['ips'][] = $ip;
+			}
+		}
+		if ($ipZones) {
+			$listedIps[] = $ip;
+			$listedByIp[$ip] = ['count' => count($ipZones), 'zones' => $ipZones];
+		} else {
+			$cleanIps[] = $ip;
+		}
+	}
+
+	foreach ($listedByZone as $z => $data) {
+		if (!empty($data['ips'])) {
+			$listedByZone[$z]['ips'] = array_values(array_unique($data['ips']));
+		}
+	}
+
+	return [
+		'total_ips' => $totalIps,
+		'total_zones' => $totalZones,
+		'total_checks' => $totalChecks,
+		'total_listed' => $totalListed,
+		'any_listed' => $totalListed > 0,
+		'listed_ips' => array_values(array_unique($listedIps)),
+		'clean_ips' => array_values($cleanIps),
+		'listed_by_ip' => $listedByIp,
+		'listed_by_zone' => $listedByZone,
+	];
+}
+
 // -------------------- Rate limiting (per client IP) --------------------
 // Simple 1-request-per-window (default 60s). Uses APCu when available,
 // otherwise a file lock in the system temp directory.
@@ -781,7 +835,8 @@ if ($queryInput !== '' && detect_wants_json()) {
 		'zones' => $zones,
 				'errors' => $errors,
 				'resolved_ips' => $resolved['ips'],
-				'results' => $results,
+		'results' => $results,
+		'summary' => build_results_summary($results, $zones),
 		], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 		exit;
 }
