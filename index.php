@@ -952,7 +952,7 @@ send_security_headers(false);
 					</div>
 					<div class="mb-3">
 						<label for="lookup" class="form-label">IP address or Domain</label>
-						<input type="text" class="form-control form-control-lg" id="lookup" name="lookup" placeholder="e.g. 8.8.8.8 or example.org" value="<?= h($queryInput) ?>" required>
+						<input type="text" class="form-control" id="lookup" name="lookup" placeholder="ip or domain" value="<?= h($queryInput) ?>" required>
 						<div class="form-text">Domains will be resolved to A (IPv4) and AAAA (IPv6) and each IP will be checked.</div>
 					</div>
 
@@ -977,7 +977,7 @@ send_security_headers(false);
 					<?php endif; ?>
 
 					<div class="mt-3 d-flex gap-2">
-						<button type="submit" class="btn btn-primary btn-lg">Check</button>
+						<button type="submit" class="btn btn-primary">Check</button>
 						<a href="/" class="btn btn-outline-secondary">Clear</a>
 						<?php if ($queryInput !== ''): ?>
 							<a class="btn btn-outline-dark" href="?<?= http_build_query(['lookup'=>$queryInput, 'dnsbl'=>$zones, 'format'=>'json']) ?>">View JSON</a>
