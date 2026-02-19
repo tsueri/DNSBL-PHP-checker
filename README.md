@@ -42,6 +42,9 @@ $EDITOR config.php
 ```
 
 Config keys (array returned by `config.php`):
+- `DNSBL_ZONES`: Array of DNSBL zones to use by default (overrides built-ins). DQS mapping still applies to Spamhaus zones when `SPAMHAUS_DQS_KEY` is set.
+- `ALLOW_CUSTOM_ZONES`: When `true`, users may override zones via `dnsbl[]` query. When `false`, the app uses only configured/default zones.
+- `FORCE_DNSBL_ZONES`: When `true`, always ignore `dnsbl[]` query and use only configured/default zones (overrides `ALLOW_CUSTOM_ZONES`).
 - `SPAMHAUS_DQS_KEY`: Spamhaus DQS key. When set, the app maps common Spamhaus zones to DQS (e.g., `zen.spamhaus.org` → `<key>.zen.dq.spamhaus.net`). The key is redacted in displayed queries.
 - `DNSBL_RESOLVER`: Force all DNS queries through a specific resolver (e.g., `127.0.0.1`). Useful to ensure queries do not go through public/open resolvers.
 - `RATE_LIMIT_IP_ALLOWLIST`: Optional array of IPs/CIDRs that bypass rate limiting (e.g., `["127.0.0.1", "::1", "10.0.0.0/8"]).
@@ -49,6 +52,9 @@ Config keys (array returned by `config.php`):
 - `ACCESS_ALLOW_ONLY_ALLOWLIST`: When `true`, only IPs/CIDRs in the allowlist can use the app; others get HTTP 403.
 
 Environment variable equivalents:
+- `DNSBL_ZONES` (comma-separated)
+- `ALLOW_CUSTOM_ZONES` (true/false)
+- `FORCE_DNSBL_ZONES` (true/false)
 - `SPAMHAUS_DQS_KEY` or `SPAMHAUS_DQS`
 - `DNSBL_RESOLVER` or `DNSBL_NAMESERVER`
 - `RATE_LIMIT_ALLOWLIST` (comma-separated IPs/CIDRs)

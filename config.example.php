@@ -1,5 +1,15 @@
 <?php
 return [
+    // DNSBL zones: override the built-in defaults by listing the zones here.
+    // DQS mapping still applies to Spamhaus zones when SPAMHAUS_DQS_KEY is set.
+    // Example:
+    // 'DNSBL_ZONES' => [
+    //     'zen.spamhaus.org',
+    //     'b.barracudacentral.org',
+    //     'dnsbl.sorbs.net',
+    //     'bl.spamcop.net',
+    // ],
+
     // Spamhaus DQS
     'SPAMHAUS_DQS_KEY' => '',
 
@@ -13,6 +23,19 @@ return [
     // Access control: when true, ONLY IPs/CIDRs in RATE_LIMIT_IP_ALLOWLIST
     // are allowed to use the app. Others receive HTTP 403.
     'ACCESS_ALLOW_ONLY_ALLOWLIST' => false,
+
+    // Zones configuration
+    // When set, this list replaces the built-in default zones.
+    // 'DNSBL_ZONES' => [
+    //     'zen.spamhaus.org',
+    //     'b.barracudacentral.org',
+    //     'dnsbl.sorbs.net',
+    //     'bl.spamcop.net',
+    // ],
+    // Allow overriding zones via GET ?dnsbl[]=... (default: true)
+    'ALLOW_CUSTOM_ZONES' => true,
+    // Force using only the configured/default zones and ignore GET overrides
+    'FORCE_DNSBL_ZONES' => false,
 
     // Rate limiting (defaults: enabled, 60s)
     'RATE_LIMIT_ENABLED' => true,

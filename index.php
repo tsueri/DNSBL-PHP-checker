@@ -158,41 +158,84 @@ function check_dnsbl(string $ip, string $zone): array {
 }
 
 function get_default_dnsbls(): array {
-		return [
-				'zen.spamhaus.org',
-				'b.barracudacentral.org',
-				'dnsbl.sorbs.net',
-				'bl.spamcop.net',
-				// Extras some users might try
-				'pbl.spamhaus.org',
-				'sbl-xbl.spamhaus.org',
-				'multi.surbl.org',
-				'spamscamalot.com',
-		];
+	// Prefer configured zones when provided; fall back to built-ins
+	$cfg = load_app_config();
+	$zonesCfg = $cfg['DNSBL_ZONES'] ?? null;
+	$zones = [];
+	if (is_array($zonesCfg)) {
+		foreach ($zonesCfg as $z) {
+			$z = strtolower(trim((string)$z));
+			if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) {
+				$zones[] = $z;
+			}
+		}
+	} elseif (is_string($zonesCfg) && trim($zonesCfg) !== '') {
+		// Allow comma-separated list if a string is supplied
+		foreach (explode(',', $zonesCfg) as $z) {
+			$z = strtolower(trim($z));
+			if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) {
+				$zones[] = $z;
+			}
+		}
+	} else {
+		// Environment variable support: DNSBL_ZONES=zone1,zone2,...
+		$env = getenv('DNSBL_ZONES');
+		if (is_string($env) && trim($env) !== '') {
+			foreach (explode(',', $env) as $z) {
+				$z = strtolower(trim($z));
+				if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) {
+					$zones[] = $z;
+				}
+			}
+		}
+	}
+
+	if ($zones) {
+		// Deduplicate and cap to 15 zones
+		$zones = array_values(array_unique($zones));
+		if (count($zones) > 15) {
+			$zones = array_slice($zones, 0, 15);
+		}
+		return $zones;
+	}
+
+	// Built-in defaults
+	return [
+		'zen.spamhaus.org',
+		'b.barracudacentral.org',
+		'dnsbl.sorbs.net',
+		'bl.spamcop.net',
+		// Extras some users might try
+		'pbl.spamhaus.org',
+		'sbl-xbl.spamhaus.org',
+		'multi.surbl.org',
+		'spamscamalot.com',
+	];
 }
 
 function parse_dnsbls_from_get(): array {
-		$zones = [];
-		if (isset($_GET['dnsbl'])) {
-				$raw = $_GET['dnsbl'];
-				if (is_array($raw)) {
-						foreach ($raw as $z) {
+	// Optionally allow custom zones via GET; can be forced off via config
+	$zones = [];
+	if (allow_custom_zones() && isset($_GET['dnsbl'])) {
+		$raw = $_GET['dnsbl'];
+		if (is_array($raw)) {
+			foreach ($raw as $z) {
 				$z = strtolower(trim((string)$z));
 				if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) $zones[] = $z;
-						}
-				} else {
-						$z = strtolower(trim((string)$raw));
+			}
+		} else {
+			$z = strtolower(trim((string)$raw));
 			if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) $zones[] = $z;
-				}
 		}
-		if (!$zones) $zones = get_default_dnsbls();
-		// Deduplicate while preserving order
+	}
+	if (!$zones) $zones = get_default_dnsbls();
+	// Deduplicate while preserving order
 	$zones = array_values(array_unique($zones));
 	// Cap to a reasonable number to avoid abuse
 	if (count($zones) > 15) {
 		$zones = array_slice($zones, 0, 15);
 	}
-		return $zones;
+	return $zones;
 }
 
 function detect_wants_json(): bool {
@@ -279,6 +322,19 @@ function get_spamhaus_dqs_key(): ?string {
 	// Basic sanity: token-like
 	if (!preg_match('/^[A-Za-z0-9_-]{6,128}$/', $key)) return null;
 	return $key;
+}
+
+// Control whether custom zones via GET are allowed
+function allow_custom_zones(): bool {
+	$cfg = load_app_config();
+	// FORCE_DNSBL_ZONES=true always disables custom zones
+	$force = $cfg['FORCE_DNSBL_ZONES'] ?? getenv('FORCE_DNSBL_ZONES') ?? null;
+	if ($force !== null && filter_var((string)$force, FILTER_VALIDATE_BOOLEAN)) {
+		return false;
+	}
+	// Otherwise honor ALLOW_CUSTOM_ZONES when present; default to true for backward compatibility
+	$allow = $cfg['ALLOW_CUSTOM_ZONES'] ?? getenv('ALLOW_CUSTOM_ZONES') ?? '1';
+	return filter_var((string)$allow, FILTER_VALIDATE_BOOLEAN);
 }
 
 function map_zone_for_query(string $zone): string {
