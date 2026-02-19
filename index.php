@@ -18,17 +18,11 @@ function load_app_config(): array {
 	return $cfg;
 }
 
-// Per-request CSP nonce for safe inline scripts
 function csp_nonce(): string {
-	static $nonce = null;
-	if ($nonce !== null) return $nonce;
-	try {
-		$bytes = random_bytes(16);
-	} catch (Exception $e) {
-		$bytes = uniqid('', true);
-	}
-	$nonce = rtrim(strtr(base64_encode((string)$bytes), '+/', '-_'), '=');
-	return $nonce;
+    static $nonce = null;
+    if ($nonce !== null) return $nonce;
+    $nonce = bin2hex(random_bytes(16));
+    return $nonce;
 }
 
 function normalize_input(string $raw): string {
@@ -208,16 +202,14 @@ function detect_wants_json(): bool {
 }
 
 function get_forced_resolver(): ?string {
-	$cfg = load_app_config();
-	$srv = $cfg['DNSBL_RESOLVER'] ?? $cfg['dnsbl_resolver'] ?? $cfg['resolver'] ?? null;
-	if (!$srv) $srv = getenv('DNSBL_RESOLVER');
-	if (!$srv) $srv = getenv('DNSBL_NAMESERVER');
-	if (!$srv) return null;
-	$srv = trim($srv);
-	// allow IPv4, IPv6, or domain names
-	if (filter_var($srv, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) !== false) return $srv;
-	if (is_valid_domain($srv)) return $srv;
-	return null;
+    $cfg = load_app_config();
+    $v = $cfg['DNSBL_RESOLVER'] ?? getenv('DNSBL_RESOLVER') ?? getenv('DNSBL_NAMESERVER') ?? null;
+    if (!$v) return null;
+    $v = trim((string)$v);
+    if (filter_var($v, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) || is_valid_domain($v)) {
+        return $v;
+    }
+    return null;
 }
 
 function dig_lookup_a_txt(string $qname, string $server): array {
@@ -499,6 +491,13 @@ function rate_limit_reset_for_ip(string $ip): array {
 		return ['backend' => 'apcu', 'removed' => ($a || $b), 'keys' => [$tsKey, $ctKey]];
 	}
 	$dir = rtrim(sys_get_temp_dir(), '/').'/dnsbl_php_checker_rl';
+	if (is_link($dir)) {
+    // Fail-open if path is a symlink
+    return [true, 0];
+}
+if (!is_dir($dir)) {
+    @mkdir($dir, 0700, true);
+}
 	$path = $dir.'/'.substr($keyBase, 7).'.dat';
 	$ok = @unlink($path);
 	return ['backend' => 'file', 'removed' => $ok, 'path' => $path];
