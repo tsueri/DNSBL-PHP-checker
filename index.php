@@ -130,7 +130,7 @@ function check_dnsbl(string $ip, string $zone): array {
 		}
 	// If a forced resolver is configured, try using dig against it first
 	$forced = get_forced_resolver();
-	if ($forced !== null) {
+	if ($forced !== null && is_shell_exec_available()) {
 		[$resp, $txt] = dig_lookup_a_txt($query, $forced);
 		if ($resp !== null || $txt !== null) {
 			// Consider listed if an A response was returned
@@ -221,6 +221,10 @@ function get_forced_resolver(): ?string {
 }
 
 function dig_lookup_a_txt(string $qname, string $server): array {
+    // If shell_exec is unavailable (disabled by host), skip using dig
+    if (!is_shell_exec_available()) {
+        return [null, null];
+    }
 	// Ensure server token is safe (no spaces or shell metachars)
 	if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $server)) {
 		return [null, null];
@@ -261,6 +265,16 @@ function dig_lookup_a_txt(string $qname, string $server): array {
 	}
 
 	return [$aIp, $txt];
+}
+
+function is_shell_exec_available(): bool {
+	if (!function_exists('shell_exec')) return false;
+	$disabled = (string)(ini_get('disable_functions') ?? '');
+	if ($disabled !== '') {
+		$list = array_map('trim', explode(',', $disabled));
+		if (in_array('shell_exec', $list, true)) return false;
+	}
+	return true;
 }
 
 function get_spamhaus_dqs_key(): ?string {
