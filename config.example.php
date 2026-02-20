@@ -37,6 +37,13 @@ return [
     // Force using only the configured/default zones and ignore GET overrides
     'FORCE_DNSBL_ZONES' => false,
 
+    // Parallelization and caching
+    // Use AMP-based parallel DNS (requires Composer dependencies installed)
+    'PARALLEL_MODE' => 'off', // 'amp' or 'off'
+    'PARALLEL_CONCURRENCY' => 6,
+    // Cache positive/negative A answers per query name to reduce load
+    'CACHE_TTL' => 300, // seconds
+
     // Rate limiting (defaults: enabled, 60s)
     'RATE_LIMIT_ENABLED' => true,
     // Allow N lookups per window per IP
