@@ -77,7 +77,36 @@ function is_valid_domain(string $input): bool {
 	return filter_var($ascii, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false;
 }
 
+function get_configured_dnsbls(): array {
+	$cfg = load_app_config();
+	$candidates = [
+		'DNSBL_ZONES', 'dnsbl_zones', 'DNSBLS', 'DNSBL_LIST', 'DEFAULT_DNSBLS', 'DEFAULT_DNSBL_ZONES'
+	];
+	$raw = null;
+	foreach ($candidates as $k) {
+		if (array_key_exists($k, $cfg)) { $raw = $cfg[$k]; break; }
+	}
+	if ($raw === null) return [];
+	$items = [];
+	if (is_string($raw)) {
+		$items = array_map('trim', explode(',', $raw));
+	} elseif (is_array($raw)) {
+		$items = array_map(static function($v){ return trim((string)$v); }, $raw);
+	} else {
+		return [];
+	}
+	$out = [];
+	foreach ($items as $z) {
+		$z = strtolower(trim($z, ". "));
+		if ($z === '' || strlen($z) > 253) continue;
+		if (is_valid_domain($z)) $out[] = $z;
+	}
+	return array_values(array_unique($out));
+}
+
 function get_default_dnsbls(): array {
+	$fromCfg = get_configured_dnsbls();
+	if ($fromCfg) return $fromCfg;
 	return [
 		'zen.spamhaus.org',
 		'pbl.spamhaus.org',
