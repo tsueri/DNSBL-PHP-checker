@@ -9,8 +9,6 @@ A single-file PHP app to check an IP address (IPv4/IPv6) or domain against commo
 - Optional Spamhaus DQS support via a key (redacted in output)
 - Optional forced resolver (e.g., 127.0.0.1) to avoid public/open resolvers
 - JSON API with `?format=json`
-- Parallel DNS (optional, via Amp) with per-op timeouts and one-shot retry
-- Completeness guarantee: automatic fallback to sequential if parallel is incomplete
 - JSON summary with totals and per-IP/per-zone breakdowns
 - Basic security headers and sane DNS timeouts
 - Optional per-IP rate limiting (default: 10 requests/hour via APCu or file fallback)
@@ -24,13 +22,7 @@ php -S localhost:8000
 # open http://localhost:8000
 ```
 
-Optional: enable faster parallel DNS with Amp (Composer):
-
-```bash
-composer require "amphp/amp:^3" "amphp/dns:^2" "amphp/sync:^2"
-```
-
-When Composer autoload is available and `PARALLEL_MODE=amp`, the app will use Amp for concurrent DNS lookups.
+ 
 
 ## Usage
 - Web UI: open `/?lookup=8.8.8.8`
@@ -60,8 +52,6 @@ Config keys (array returned by `config.php`):
 - `SPAMHAUS_DQS_KEY`: Spamhaus DQS key. When set, the app maps common Spamhaus zones to DQS (e.g., `zen.spamhaus.org` → `<key>.zen.dq.spamhaus.net`). The key is redacted in displayed queries.
   - If you list `*.dq.spamhaus.net` zones without a key prefix (e.g., `dbl.dq.spamhaus.net`) the app will automatically prefix them with your key: `<key>.dbl.dq.spamhaus.net`.
 - `DNSBL_RESOLVER`: Force all DNS queries through a specific resolver (e.g., `127.0.0.1`). Useful to ensure queries do not go through public/open resolvers.
-- `PARALLEL_MODE`: `'amp'` to enable Amp-based parallel DNS, `'off'` for sequential (default `'off'`). Automatically disabled if `DNSBL_RESOLVER` is set.
-- `PARALLEL_CONCURRENCY`: Max concurrent DNS tasks when in Amp mode (1–32, default `6`).
 - `DNS_TIMEOUT_MS`: Per-DNS operation timeout in milliseconds (100–30000, default `5000`).
 - `CACHE_TTL`: Seconds to cache A answers (default `300`). Cached empty string means “not listed”.
 - `RATE_LIMIT_IP_ALLOWLIST`: Optional array of IPs/CIDRs that bypass rate limiting (e.g., `["127.0.0.1", "::1", "10.0.0.0/8"]).
@@ -74,22 +64,15 @@ Environment variable equivalents:
 - `FORCE_DNSBL_ZONES` (true/false)
 - `SPAMHAUS_DQS_KEY` or `SPAMHAUS_DQS`
 - `DNSBL_RESOLVER` or `DNSBL_NAMESERVER`
-- `PARALLEL_MODE` (`amp`/`off`), `PARALLEL_CONCURRENCY`, `DNS_TIMEOUT_MS`, `CACHE_TTL`
+- `DNS_TIMEOUT_MS`, `CACHE_TTL`
 - `RATE_LIMIT_ALLOWLIST` (comma-separated IPs/CIDRs)
 - `ADMIN_API_TOKEN`
 - `ACCESS_ALLOW_ONLY_ALLOWLIST` (true/false)
 
 The app reads `config.php` first, then falls back to environment variables.
 
-### Parallel Execution (Amp)
-- When `PARALLEL_MODE=amp` and Composer autoload is available, DNS A/TXT lookups run concurrently with a semaphore-limited concurrency.
-- Each A/TXT query has a per-operation timeout and a one-shot retry (two attempts total) to handle transient resolver hiccups.
-- Completeness is guaranteed: if the parallel batch returns fewer results than expected, the app automatically reruns the full matrix sequentially and returns the complete results.
-- If `DNSBL_RESOLVER` is configured, Amp mode is disabled to ensure all queries use your forced resolver.
-
-Diagnostics (useful during setup):
-- Response headers include `X-App-Build` (last app mtime), `X-Parallel-Mode` (`amp` or `off`), and `X-Parallel-Fallback` (`1` if a sequential fallback was performed).
-- JSON includes `parallel: { mode, fallback }` and a `complete` flag with `expected_checks` and `actual_checks`.
+### Execution Model
+All DNSBL checks run sequentially. Each A lookup and (when listed) TXT lookup has its own timeout (`DNS_TIMEOUT_MS`), and per-result timing fields (`a_ms`, `txt_ms`, `total_ms`) are included in the JSON output.
 
 ### Rate Limiting
 Per-IP rate limiting is enabled by default: 10 requests per hour. It uses APCu when available; otherwise, it falls back to a lock file in the system temp directory.
@@ -166,7 +149,6 @@ curl -s "http://localhost:8000/?lookup=8.8.8.8&dnsbl[]=zen.spamhaus.org&dnsbl[]=
       "dnsbl.sorbs.net": { "listed": false, "response": null, "txt": null, "query": "...", "error": null }
     }
   },
-  "parallel": { "mode": "amp|off", "fallback": false },
   "summary": {
     "total_ips": 1,
     "total_zones": 2,
@@ -186,8 +168,6 @@ curl -s "http://localhost:8000/?lookup=8.8.8.8&dnsbl[]=zen.spamhaus.org&dnsbl[]=
 
 ### Response Headers (selected)
 - `X-App-Build`: ISO8601 timestamp of the current app build (based on file mtime)
-- `X-Parallel-Mode`: `amp` or `off`
-- `X-Parallel-Fallback`: `1` when parallel fell back to sequential to ensure completeness
 - `Retry-After`: present on HTTP 429 responses
 
 ## Security & Limits
@@ -203,15 +183,10 @@ curl -s "http://localhost:8000/?lookup=8.8.8.8&dnsbl[]=zen.spamhaus.org&dnsbl[]=
 - For best results, run with a local recursive resolver or DQS when using Spamhaus zones.
 
 ## Troubleshooting
-- Verify the running build and execution path:
+- Verify the running build header:
   ```bash
-  curl -sD - -o /dev/null "http://localhost:8000/?lookup=8.8.8.8" | grep -i -E "x-app-build|x-parallel"
+  curl -sD - -o /dev/null "http://localhost:8000/?lookup=8.8.8.8" | grep -i "x-app-build"
   ```
-- If you see `X-Parallel-Fallback: 1` frequently, consider:
-  - Increasing `DNS_TIMEOUT_MS` (e.g., 7000–10000)
-  - Adjusting `PARALLEL_CONCURRENCY` to match your resolver capacity
-  - Setting `PARALLEL_MODE=off` to compare sequential behavior
-  - Configuring `DNSBL_RESOLVER` to a local closed resolver
 - Rate limited? Use the admin reset endpoint after setting `ADMIN_API_TOKEN`:
   ```bash
   curl -s "http://localhost:8000/?admin=reset_rate_limit&ip=127.0.0.1&token=<ADMIN_API_TOKEN>" | jq

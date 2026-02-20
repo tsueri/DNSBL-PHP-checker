@@ -17,6 +17,13 @@ function h($s): string {
 	}
 	return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
+function detect_wants_json(): bool {
+		if (isset($_GET['format']) && strtolower((string)$_GET['format']) === 'json') return true;
+		$accept = $_SERVER['HTTP_ACCEPT'] ?? '';
+		return stripos($accept, 'application/json') !== false;
+}
+
+// -------------------- App/config helpers and DNS utils --------------------
 
 function load_app_config(): array {
 	static $cfg = null;
@@ -31,32 +38,28 @@ function load_app_config(): array {
 }
 
 function csp_nonce(): string {
-    static $nonce = null;
-    if ($nonce !== null) return $nonce;
-    $nonce = bin2hex(random_bytes(16));
-    return $nonce;
+	static $nonce = null;
+	if ($nonce !== null) return $nonce;
+	$nonce = bin2hex(random_bytes(16));
+	return $nonce;
 }
 
 function normalize_input(string $raw): string {
-		$s = trim($raw);
-		// Strip brackets around IPv6 like [2001:db8::1]
-		if (strlen($s) > 2 && $s[0] === '[' && substr($s, -1) === ']') {
-				$s = substr($s, 1, -1);
-		}
-		return $s;
+	$s = trim($raw);
+	if (strlen($s) > 2 && $s[0] === '[' && substr($s, -1) === ']') {
+		$s = substr($s, 1, -1);
+	}
+	return $s;
 }
 
 function is_valid_ip(string $input): bool {
-		return filter_var($input, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) !== false;
+	return filter_var($input, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) !== false;
 }
 
 function to_ascii_domain(string $host): ?string {
 	$host = rtrim($host, '.');
-	// Enforce basic length limits for domains
 	if ($host === '' || strlen($host) > 253) return null;
-	// Use idn_to_ascii if available for IDN; be compatible across PHP versions
 	if (function_exists('idn_to_ascii')) {
-		// PHP < 8.3 had a variant parameter; >= 8.3 uses UTS #46 by default
 		if (defined('INTL_IDNA_VARIANT_UTS46') && PHP_VERSION_ID < 80300) {
 			$ascii = idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
 		} else {
@@ -69,176 +72,83 @@ function to_ascii_domain(string $host): ?string {
 }
 
 function is_valid_domain(string $input): bool {
-		$ascii = to_ascii_domain($input);
-		if ($ascii === null) return false;
-		// FILTER_VALIDATE_DOMAIN with HOSTNAME flag: only hostnames, no scheme/path
-		return filter_var($ascii, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false;
-}
-
-function resolve_domain_ips(string $domain): array {
-		$ips = [];
-		$ascii = to_ascii_domain($domain);
-		if ($ascii === null) return $ips;
-		// IPv4
-		$a = @dns_get_record($ascii, DNS_A);
-		if (is_array($a)) {
-				foreach ($a as $rec) {
-						if (!empty($rec['ip']) && is_valid_ip($rec['ip'])) {
-								$ips['ipv4'][] = $rec['ip'];
-						}
-				}
-		}
-		// IPv6
-		$aaaa = @dns_get_record($ascii, DNS_AAAA);
-		if (is_array($aaaa)) {
-				foreach ($aaaa as $rec) {
-						if (!empty($rec['ipv6']) && is_valid_ip($rec['ipv6'])) {
-								$ips['ipv6'][] = $rec['ipv6'];
-						}
-				}
-		}
-		// Deduplicate
-		foreach (['ipv4','ipv6'] as $k) {
-				if (isset($ips[$k])) $ips[$k] = array_values(array_unique($ips[$k]));
-		}
-		return $ips;
-}
-
-function ipv4_to_reversed(string $ip): string {
-		return implode('.', array_reverse(explode('.', $ip)));
-}
-
-function ipv6_to_reversed_nibbles(string $ip): ?string {
-		$packed = @inet_pton($ip);
-		if ($packed === false) return null;
-		$hex = bin2hex($packed); // 32 hex chars
-		$nibbles = str_split($hex, 1);
-		$nibbles = array_reverse($nibbles);
-		return implode('.', $nibbles);
-}
-
-function dnsbl_query_name(string $ip, string $zone): ?string {
-		if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-				return ipv4_to_reversed($ip) . '.' . $zone;
-		}
-		if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-				$rev = ipv6_to_reversed_nibbles($ip);
-				if ($rev === null) return null;
-				return $rev . '.' . $zone;
-		}
-		return null;
-}
-
-function check_dnsbl(string $ip, string $zone): array {
-		$query = dnsbl_query_name($ip, $zone);
-		if ($query === null) {
-				return ['listed' => false, 'response' => null, 'txt' => null, 'query' => null, 'error' => 'invalid-ip', 'a_ms' => 0, 'txt_ms' => 0, 'total_ms' => 0];
-		}
-	$overallStart = microtime(true);
-	// If a forced resolver is configured, try using dig against it first
-	$forced = get_forced_resolver();
-	if ($forced !== null && is_shell_exec_available()) {
-		$digStart = microtime(true);
-		[$resp, $txt] = dig_lookup_a_txt($query, $forced);
-		$digMs = (int) round((microtime(true) - $digStart) * 1000);
-		if ($resp !== null || $txt !== null) {
-			// Consider listed if an A response was returned
-			return [
-				'listed' => $resp !== null,
-				'response' => $resp,
-				'txt' => $txt,
-				'query' => redact_dqs_in_query($query),
-				'error' => null,
-				'a_ms' => null,
-				'txt_ms' => null,
-				'total_ms' => $digMs,
-			];
-		}
-		// fall through to system resolver if dig failed/unavailable
-	}
-
-	$tA1 = microtime(true);
-	$aRecords = @dns_get_record($query, DNS_A);
-	$aMs = (int) round((microtime(true) - $tA1) * 1000);
-	$listed = is_array($aRecords) && count($aRecords) > 0;
-	$response = $listed ? ($aRecords[0]['ip'] ?? null) : null;
-	$txt = null;
-	$txtMs = 0;
-	if ($listed) {
-		$tT1 = microtime(true);
-		$txtRecs = @dns_get_record($query, DNS_TXT);
-		$txtMs = (int) round((microtime(true) - $tT1) * 1000);
-		if (is_array($txtRecs) && count($txtRecs) > 0) {
-			// Some DNSBLs return multiple TXT strings; join them
-			$txtParts = [];
-			foreach ($txtRecs as $t) {
-				if (isset($t['txt'])) $txtParts[] = $t['txt'];
-			}
-			if ($txtParts) $txt = implode(' | ', $txtParts);
-		}
-	}
-	$totalMs = $aMs + ($txtMs ?? 0);
-	return ['listed' => $listed, 'response' => $response, 'txt' => $txt, 'query' => redact_dqs_in_query($query), 'error' => null, 'a_ms' => $aMs, 'txt_ms' => $txtMs, 'total_ms' => $totalMs];
+	$ascii = to_ascii_domain($input);
+	if ($ascii === null) return false;
+	return filter_var($ascii, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false;
 }
 
 function get_default_dnsbls(): array {
-	// Prefer configured zones when provided; fall back to built-ins
-	$cfg = load_app_config();
-	$zonesCfg = $cfg['DNSBL_ZONES'] ?? null;
-	$zones = [];
-	if (is_array($zonesCfg)) {
-		foreach ($zonesCfg as $z) {
-			$z = strtolower(trim((string)$z));
-			if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) {
-				$zones[] = $z;
-			}
-		}
-	} elseif (is_string($zonesCfg) && trim($zonesCfg) !== '') {
-		// Allow comma-separated list if a string is supplied
-		foreach (explode(',', $zonesCfg) as $z) {
-			$z = strtolower(trim($z));
-			if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) {
-				$zones[] = $z;
-			}
-		}
-	} else {
-		// Environment variable support: DNSBL_ZONES=zone1,zone2,...
-		$env = getenv('DNSBL_ZONES');
-		if (is_string($env) && trim($env) !== '') {
-			foreach (explode(',', $env) as $z) {
-				$z = strtolower(trim($z));
-				if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) {
-					$zones[] = $z;
-				}
-			}
-		}
-	}
-
-	if ($zones) {
-		// Deduplicate and cap to 15 zones
-		$zones = array_values(array_unique($zones));
-		if (count($zones) > 15) {
-			$zones = array_slice($zones, 0, 15);
-		}
-		return $zones;
-	}
-
-	// Built-in defaults
 	return [
 		'zen.spamhaus.org',
-		'b.barracudacentral.org',
-		'dnsbl.sorbs.net',
-		'bl.spamcop.net',
-		// Extras some users might try
 		'pbl.spamhaus.org',
 		'sbl-xbl.spamhaus.org',
+		'b.barracudacentral.org',
+		'bl.spamcop.net',
 		'multi.surbl.org',
 		'spamscamalot.com',
+		'dnsbl.sorbs.net',
 	];
 }
 
+function allow_custom_zones(): bool {
+	$cfg = load_app_config();
+	$force = $cfg['FORCE_DNSBL_ZONES'] ?? getenv('FORCE_DNSBL_ZONES') ?? null;
+	if ($force !== null && filter_var((string)$force, FILTER_VALIDATE_BOOLEAN)) {
+		return false;
+	}
+	$allow = $cfg['ALLOW_CUSTOM_ZONES'] ?? getenv('ALLOW_CUSTOM_ZONES') ?? '1';
+	return filter_var((string)$allow, FILTER_VALIDATE_BOOLEAN);
+}
+
+function get_spamhaus_dqs_key(): ?string {
+	$cfg = load_app_config();
+	$key = $cfg['SPAMHAUS_DQS_KEY'] ?? $cfg['spamhaus_dqs_key'] ?? null;
+	if (!$key) $key = getenv('SPAMHAUS_DQS_KEY');
+	if (!$key) $key = getenv('SPAMHAUS_DQS');
+	if (!$key) return null;
+	$key = trim($key);
+	if (!preg_match('/^[A-Za-z0-9_-]{6,128}$/', $key)) return null;
+	return $key;
+}
+
+function map_zone_for_query(string $zone): string {
+	$key = get_spamhaus_dqs_key();
+	$z = strtolower(trim($zone, '.'));
+	if ($key === null) return $z;
+	if (str_ends_with($z, '.dq.spamhaus.net')) {
+		if (stripos($z, strtolower($key) . '.') === 0) return $z;
+		return $key . '.' . $z;
+	}
+	$map = [
+		'zen.spamhaus.org' => 'zen.dq.spamhaus.net',
+		'pbl.spamhaus.org' => 'pbl.dq.spamhaus.net',
+		'sbl-xbl.spamhaus.org' => 'sbl-xbl.dq.spamhaus.net',
+		'sbl.spamhaus.org' => 'sbl.dq.spamhaus.net',
+		'xbl.spamhaus.org' => 'xbl.dq.spamhaus.net',
+		'dbl.spamhaus.org' => 'dbl.dq.spamhaus.net',
+		'zrd.spamhaus.org' => 'zrd.dq.spamhaus.net',
+	];
+	if (isset($map[$z])) return $key . '.' . $map[$z];
+	return $z;
+}
+
+function redact_dqs_in_query(string $s): string {
+	$key = get_spamhaus_dqs_key();
+	if ($key === null || $key === '') return $s;
+	return str_replace($key . '.', '****' . '.', $s);
+}
+
+function is_shell_exec_available(): bool {
+	if (!function_exists('shell_exec')) return false;
+	$disabled = (string)(ini_get('disable_functions') ?? '');
+	if ($disabled !== '') {
+		$list = array_map('trim', explode(',', $disabled));
+		if (in_array('shell_exec', $list, true)) return false;
+	}
+	return true;
+}
+
 function parse_dnsbls_from_get(): array {
-	// Optionally allow custom zones via GET; can be forced off via config
 	$zones = [];
 	if (allow_custom_zones() && isset($_GET['dnsbl'])) {
 		$raw = $_GET['dnsbl'];
@@ -253,60 +163,70 @@ function parse_dnsbls_from_get(): array {
 		}
 	}
 	if (!$zones) $zones = get_default_dnsbls();
-	// Deduplicate while preserving order
 	$zones = array_values(array_unique($zones));
-	// Cap to a reasonable number to avoid abuse
-	if (count($zones) > 15) {
-		$zones = array_slice($zones, 0, 15);
-	}
+	if (count($zones) > 15) $zones = array_slice($zones, 0, 15);
 	return $zones;
 }
 
-function detect_wants_json(): bool {
-		if (isset($_GET['format']) && strtolower((string)$_GET['format']) === 'json') return true;
-		$accept = $_SERVER['HTTP_ACCEPT'] ?? '';
-		return stripos($accept, 'application/json') !== false;
+function get_forced_resolver(): ?string {
+	$cfg = load_app_config();
+	$v = $cfg['DNSBL_RESOLVER'] ?? getenv('DNSBL_RESOLVER') ?? getenv('DNSBL_NAMESERVER') ?? null;
+	if (!$v) return null;
+	$v = trim((string)$v);
+	if (filter_var($v, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) || is_valid_domain($v)) {
+		return $v;
+	}
+	return null;
 }
 
-function get_forced_resolver(): ?string {
-    $cfg = load_app_config();
-    $v = $cfg['DNSBL_RESOLVER'] ?? getenv('DNSBL_RESOLVER') ?? getenv('DNSBL_NAMESERVER') ?? null;
-    if (!$v) return null;
-    $v = trim((string)$v);
-    if (filter_var($v, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6) || is_valid_domain($v)) {
-        return $v;
-    }
-    return null;
+function dnsbl_query_name(string $ip, string $zone): ?string {
+	$zone = rtrim($zone, '.');
+	if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+		$parts = array_reverse(explode('.', $ip));
+		return implode('.', $parts) . '.' . $zone;
+	}
+	if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+		$bin = inet_pton($ip);
+		if ($bin === false) return null;
+		$hex = unpack('H*', $bin)[1];
+		$nibbles = str_split(strrev($hex));
+		return implode('.', $nibbles) . '.ip6.' . $zone;
+	}
+	return null;
+}
+
+function resolve_domain_ips(string $domain): array {
+	$out = ['ipv4' => [], 'ipv6' => []];
+	$ascii = to_ascii_domain($domain);
+	if ($ascii === null) return $out;
+	$a = @dns_get_record($ascii, DNS_A);
+	if (is_array($a)) {
+		foreach ($a as $rec) if (!empty($rec['ip'])) $out['ipv4'][] = $rec['ip'];
+	}
+	$aaaa = @dns_get_record($ascii, DNS_AAAA);
+	if (is_array($aaaa)) {
+		foreach ($aaaa as $rec) if (!empty($rec['ipv6'])) $out['ipv6'][] = $rec['ipv6'];
+	}
+	$out['ipv4'] = array_values(array_unique($out['ipv4']));
+	$out['ipv6'] = array_values(array_unique($out['ipv6']));
+	return $out;
 }
 
 function dig_lookup_a_txt(string $qname, string $server): array {
-    // If shell_exec is unavailable (disabled by host), skip using dig
-    if (!is_shell_exec_available()) {
-        return [null, null];
-    }
-	// Ensure server token is safe (no spaces or shell metachars)
-	if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $server)) {
-		return [null, null];
-	}
-	$serverArg = '@' . $server; // validated
+	if (!is_shell_exec_available()) return [null, null];
+	if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $server)) return [null, null];
+	$serverArg = '@' . $server;
 	$qArg = escapeshellarg($qname);
-
-	// A record
 	$cmdA = "dig +time=2 +tries=1 +retry=0 +short $serverArg $qArg A 2>/dev/null";
 	$outA = @shell_exec($cmdA);
 	$aIp = null;
 	if (is_string($outA)) {
 		foreach (preg_split('/\r?\n/', trim($outA)) as $line) {
-			$line = trim($line, "\" \t\r\n");
+			$line = trim($line, '" \t\r\n');
 			if ($line === '') continue;
-			if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6)) {
-				$aIp = $line;
-				break;
-			}
+			if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6)) { $aIp = $line; break; }
 		}
 	}
-
-	// TXT records (optional)
 	$cmdT = "dig +time=2 +tries=1 +retry=0 +short $serverArg $qArg TXT 2>/dev/null";
 	$outT = @shell_exec($cmdT);
 	$txt = null;
@@ -314,334 +234,88 @@ function dig_lookup_a_txt(string $qname, string $server): array {
 		$parts = [];
 		foreach (preg_split('/\r?\n/', trim($outT)) as $line) {
 			$line = trim($line);
-			// remove surrounding quotes and collapse multi-part text
 			$line = preg_replace('/^\"|\"$/', '', $line);
-			$line = str_replace('" "', ' ', $line); // join multi-strings from dig
+			$line = str_replace('" "', ' ', $line);
 			$line = trim($line, '"');
 			if ($line !== '') $parts[] = $line;
 		}
 		if ($parts) $txt = implode(' | ', $parts);
 	}
-
 	return [$aIp, $txt];
 }
 
-function is_shell_exec_available(): bool {
-	if (!function_exists('shell_exec')) return false;
-	$disabled = (string)(ini_get('disable_functions') ?? '');
-	if ($disabled !== '') {
-		$list = array_map('trim', explode(',', $disabled));
-		if (in_array('shell_exec', $list, true)) return false;
-	}
-	return true;
-}
-
-function get_spamhaus_dqs_key(): ?string {
-	$cfg = load_app_config();
-	$key = $cfg['SPAMHAUS_DQS_KEY'] ?? $cfg['spamhaus_dqs_key'] ?? null;
-	if (!$key) $key = getenv('SPAMHAUS_DQS_KEY');
-	if (!$key) $key = getenv('SPAMHAUS_DQS');
-	if (!$key) return null;
-	$key = trim($key);
-	// Basic sanity: token-like
-	if (!preg_match('/^[A-Za-z0-9_-]{6,128}$/', $key)) return null;
-	return $key;
-}
-
-// Control whether custom zones via GET are allowed
-function allow_custom_zones(): bool {
-	$cfg = load_app_config();
-	// FORCE_DNSBL_ZONES=true always disables custom zones
-	$force = $cfg['FORCE_DNSBL_ZONES'] ?? getenv('FORCE_DNSBL_ZONES') ?? null;
-	if ($force !== null && filter_var((string)$force, FILTER_VALIDATE_BOOLEAN)) {
-		return false;
-	}
-	// Otherwise honor ALLOW_CUSTOM_ZONES when present; default to true for backward compatibility
-	$allow = $cfg['ALLOW_CUSTOM_ZONES'] ?? getenv('ALLOW_CUSTOM_ZONES') ?? '1';
-	return filter_var((string)$allow, FILTER_VALIDATE_BOOLEAN);
-}
-
-function map_zone_for_query(string $zone): string {
-	$key = get_spamhaus_dqs_key();
-	if ($key === null) return $zone;
-	$z = strtolower(trim($zone, '.'));
-	// If zone is already a DQS host but missing the key prefix, add it
-	if (str_ends_with($z, '.dq.spamhaus.net')) {
-		// If it already begins with the key., leave unchanged
-		if (stripos($z, strtolower($key) . '.') === 0) return $z;
-		return $key . '.' . $z;
-	}
-	// Map common Spamhaus .org zones to their DQS equivalents
-	$map = [
-		'zen.spamhaus.org' => 'zen.dq.spamhaus.net',
-		'pbl.spamhaus.org' => 'pbl.dq.spamhaus.net',
-		'sbl-xbl.spamhaus.org' => 'sbl-xbl.dq.spamhaus.net',
-		'sbl.spamhaus.org' => 'sbl.dq.spamhaus.net',
-		'xbl.spamhaus.org' => 'xbl.dq.spamhaus.net',
-		'dbl.spamhaus.org' => 'dbl.dq.spamhaus.net',
-		'zrd.spamhaus.org' => 'zrd.dq.spamhaus.net',
-	];
-	if (isset($map[$z])) {
-		return $key . '.' . $map[$z];
-	}
-	return $z;
-}
-
-function redact_dqs_in_query(string $s): string {
-	$key = get_spamhaus_dqs_key();
-	if ($key === null || $key === '') return $s;
-	return str_replace($key . '.', '****' . '.', $s);
-}
-
-function send_security_headers(bool $isJson): void {
-	// Basic hardening headers
-	header('X-Content-Type-Options: nosniff');
-	header('Referrer-Policy: no-referrer');
-	header('X-Frame-Options: DENY');
-	header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
-    // Stamp current build (helps verify latest code is running)
-    $build = @filemtime(__FILE__) ?: time();
-    header('X-App-Build: '.gmdate('c', (int)$build));
-	if ($isJson) {
-		// Strict CSP for JSON
-		header("Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+function check_dnsbl(string $ip, string $zoneEff): array {
+	$qname = dnsbl_query_name($ip, $zoneEff);
+	if ($qname === null) return ['listed'=>false,'response'=>null,'txt'=>null,'query'=>'','error'=>'bad_qname','a_ms'=>0,'txt_ms'=>0,'total_ms'=>0];
+	$qDisp = redact_dqs_in_query($qname);
+	$server = get_forced_resolver();
+	$aStart = microtime(true);
+	$aIp = null; $txt = null; $aMs = 0; $tMs = 0;
+	if ($server) {
+		[$aIp, $txt] = dig_lookup_a_txt($qname, $server);
+		$aMs = (int) round((microtime(true) - $aStart) * 1000);
+		// dig_lookup returns both; we count total as a_ms when txt included
+		if ($aIp !== null && $txt === null) {
+			// fetch TXT separately if listed
+			$ts = microtime(true);
+			[$dummy, $txt2] = dig_lookup_a_txt($qname, $server);
+			$tMs = (int) round((microtime(true) - $ts) * 1000);
+			if ($txt2 !== null) $txt = $txt2;
+		}
 	} else {
-		// Allow Bootstrap CDN
-		$nonce = csp_nonce();
-		header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-".$nonce."' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'");
-	}
-}
-
-// -------------------- Optional Composer autoload --------------------
-// Load Composer autoloader if available (for optional AMP parallel DNS)
-if (file_exists(__DIR__ . '/vendor/autoload.php')) {
-	@require_once __DIR__ . '/vendor/autoload.php';
-}
-
-// -------------------- Simple cache (APCu or file) --------------------
-function cache_get(string $key): mixed {
-	// APCu fast-path
-	if (function_exists('apcu_fetch') && filter_var(ini_get('apcu.enabled') ?: ini_get('apc.enabled') ?: '0', FILTER_VALIDATE_BOOLEAN)) {
-		return apcu_fetch($key) ?: null;
-	}
-	$dir = rtrim(sys_get_temp_dir(), '/').'/dnsbl_php_checker_cache';
-	$path = $dir.'/'.hash('sha256', $key).'.json';
-	if (!is_file($path)) return null;
-	$json = @file_get_contents($path);
-	if ($json === false) return null;
-	$data = @json_decode($json, true);
-	if (!is_array($data) || !isset($data['exp'])) return null;
-	if ($data['exp'] < time()) { @unlink($path); return null; }
-	return $data['val'] ?? null;
-}
-
-function cache_set(string $key, mixed $val, int $ttl): void {
-	if ($ttl <= 0) return;
-	// APCu fast-path
-	if (function_exists('apcu_store') && filter_var(ini_get('apcu.enabled') ?: ini_get('apc.enabled') ?: '0', FILTER_VALIDATE_BOOLEAN)) {
-		@apcu_store($key, $val, $ttl);
-		return;
-	}
-	$dir = rtrim(sys_get_temp_dir(), '/').'/dnsbl_php_checker_cache';
-	if (is_link($dir)) return; // safety
-	if (!is_dir($dir)) { @mkdir($dir, 0700, true); }
-	$path = $dir.'/'.hash('sha256', $key).'.json';
-	$data = ['exp' => time() + $ttl, 'val' => $val];
-	@file_put_contents($path, json_encode($data), LOCK_EX);
-	@chmod($path, 0600);
-}
-
-function get_cache_ttl(): int {
-	$cfg = load_app_config();
-	$v = $cfg['CACHE_TTL'] ?? getenv('CACHE_TTL') ?? 300; // default 5 minutes
-	$t = (int)$v;
-	if ($t < 0) $t = 0;
-	if ($t > 86400) $t = 86400;
-	return $t;
-}
-
-function get_dns_timeout_ms(): int {
-	$cfg = load_app_config();
-	$v = $cfg['DNS_TIMEOUT_MS'] ?? getenv('DNS_TIMEOUT_MS') ?? 5000; // default 5s per DNS op
-	$t = (int)$v;
-	if ($t < 100) $t = 100; // floor at 100ms to avoid zero
-	if ($t > 30000) $t = 30000; // cap at 30s per op
-	return $t;
-}
-
-// -------------------- Parallel DNS via AMP (optional) --------------------
-function should_use_amp_parallel(): bool {
-	// Do not use AMP path when a forced resolver is configured (to honor that setting)
-	if (get_forced_resolver() !== null) return false;
-	$cfg = load_app_config();
-	$mode = strtolower((string)($cfg['PARALLEL_MODE'] ?? getenv('PARALLEL_MODE') ?? 'off'));
-	if ($mode !== 'amp') return false;
-	return function_exists('Amp\\Dns\\resolve') && class_exists('Amp\\Future');
-}
-
-function get_parallel_concurrency(): int {
-	$cfg = load_app_config();
-	$v = $cfg['PARALLEL_CONCURRENCY'] ?? getenv('PARALLEL_CONCURRENCY') ?? 6;
-	$n = (int)$v;
-	if ($n < 1) $n = 1;
-	if ($n > 32) $n = 32;
-	return $n;
-}
-
-/**
- * Run DNSBL checks in parallel using Amp DNS.
- * @param array{ipv4:array, ipv6:array} $ipsByFam
- * @param string[] $zonesDisplay List of zones as displayed (before DQS mapping)
- * @return array results[ip][zoneDisplay] = ['listed','response','txt','query','error']
- */
-function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, int $cacheTtl): array {
-	// Import functions/classes inside to avoid hard dependencies when AMP is absent
-	$dnsQuery = '\\Amp\\Dns\\query';
-	$async = '\\Amp\\async';
-	$awaitAll = '\\Amp\\Future\\awaitAll';
-	$LocalSemaphore = 'Amp\\Sync\\LocalSemaphore';
-
-	$results = [];
-	$tasks = [];
-	$keys = [];
-	$sem = new $LocalSemaphore($concurrency);
-	$timeoutMs = get_dns_timeout_ms();
-
-	// Build A lookups
-	foreach (['ipv4','ipv6'] as $fam) {
-		foreach (($ipsByFam[$fam] ?? []) as $ip) {
-			foreach ($zonesDisplay as $zoneDisplay) {
-				$zoneEff = map_zone_for_query($zoneDisplay);
-				$qname = dnsbl_query_name($ip, $zoneEff);
-				if ($qname === null) continue;
-				$ckey = 'A:' . $qname;
-				$cached = cache_get($ckey);
-				if ($cached !== null) {
-					// Store immediate result; cached empty string means not listed
-					$aIp = is_string($cached) && $cached !== '' ? $cached : null;
-					$results[$ip][$zoneDisplay] = [
-						'listed' => $aIp !== null,
-						'response' => $aIp,
-						'txt' => null,
-						'query' => redact_dqs_in_query($qname),
-						'error' => null,
-						'a_ms' => 0,
-						'txt_ms' => 0,
-						'total_ms' => 0,
-					];
-					continue;
+		$recs = @dns_get_record($qname, DNS_A);
+		if (is_array($recs) && $recs) {
+			foreach ($recs as $rec) {
+				if (!empty($rec['ip']) && filter_var($rec['ip'], FILTER_VALIDATE_IP)) { $aIp = $rec['ip']; break; }
+			}
+		}
+		$aMs = (int) round((microtime(true) - $aStart) * 1000);
+		if ($aIp !== null) {
+			$ts = microtime(true);
+			$txtRecs = @dns_get_record($qname, DNS_TXT);
+			if (is_array($txtRecs)) {
+				$parts = [];
+				foreach ($txtRecs as $rec) {
+					if (!empty($rec['txt'])) $parts[] = (string)$rec['txt'];
 				}
-				$keys[] = [$ip, $zoneDisplay, $qname];
-				$tasks[] = $async(function () use ($sem, $dnsQuery, $qname, $ckey, $cacheTtl, $timeoutMs) {
-					$lock = $sem->acquire();
-					try {
-						$aIp = null;
-						$aMs = 0;
-						for ($attempt = 1; $attempt <= 2 && $aIp === null; $attempt++) {
-							$start = microtime(true);
-							try {
-								$recs = $dnsQuery($qname, \Amp\Dns\DnsRecord::A, new \Amp\TimeoutCancellation($timeoutMs));
-							} catch (\Throwable $e) {
-								$recs = [];
-							}
-							if (is_array($recs) && $recs) {
-								$rec = $recs[0];
-								if (is_object($rec) && method_exists($rec, 'getValue')) {
-									$val = (string)$rec->getValue();
-									if ($val !== '') $aIp = $val;
-								}
-							}
-							$aMs += (int) round((microtime(true) - $start) * 1000);
-						}
-						cache_set($ckey, $aIp ?? '', $cacheTtl);
-						return ['aIp' => $aIp, 'a_ms' => $aMs];
-					} finally {
-						if (isset($lock) && method_exists($lock, 'release')) { $lock->release(); }
-					}
-				});
+				if ($parts) $txt = implode(' | ', $parts);
 			}
+			$tMs = (int) round((microtime(true) - $ts) * 1000);
 		}
 	}
+	$total = $aMs + $tMs;
+	return [
+		'listed' => $aIp !== null,
+		'response' => $aIp,
+		'txt' => $txt,
+		'query' => $qDisp,
+		'error' => null,
+		'a_ms' => $aMs,
+		'txt_ms' => $tMs,
+		'total_ms' => $total,
+	];
+}
 
-	// Await all A lookups and populate results
-	if ($tasks) {
-		$out = $awaitAll($tasks);
-			foreach ($out as $i => $aRes) {
-			[$ip, $zoneDisplay, $qname] = $keys[$i];
-				$aIp = is_array($aRes) ? ($aRes['aIp'] ?? null) : (null);
-				$aMs = is_array($aRes) ? (int)($aRes['a_ms'] ?? 0) : 0;
-				$results[$ip][$zoneDisplay] = [
-					'listed' => $aIp !== null,
-					'response' => $aIp,
-					'txt' => null,
-					'query' => redact_dqs_in_query($qname),
-					'error' => null,
-					'a_ms' => $aMs,
-					'txt_ms' => 0,
-					'total_ms' => $aMs,
-				];
-		}
-	}
-
-	// TXT lookups for listed entries only
-	$txtTasks = [];
-	$txtKeys = [];
-	foreach ($results as $ip => $zones) {
-		foreach ($zones as $zoneDisplay => $entry) {
-			if (!empty($entry['listed'])) {
-				$zoneEff = map_zone_for_query($zoneDisplay);
-				$qname = dnsbl_query_name((string)$ip, $zoneEff);
-				if ($qname === null) continue;
-				$txtKeys[] = [$ip, $zoneDisplay];
-				$txtTasks[] = $async(function () use ($sem, $dnsQuery, $qname, $timeoutMs) {
-					$lock = $sem->acquire();
-					try {
-						$txt = null;
-						$txtAccumMs = 0;
-						for ($attempt = 1; $attempt <= 2 && $txt === null; $attempt++) {
-							$start = microtime(true);
-							try {
-								$recs = $dnsQuery($qname, \Amp\Dns\DnsRecord::TXT, new \Amp\TimeoutCancellation($timeoutMs));
-							} catch (\Throwable $e) {
-								$recs = [];
-							}
-							$parts = [];
-							if (is_array($recs)) {
-								foreach ($recs as $rec) {
-									if (is_object($rec) && method_exists($rec, 'getValue')) {
-										$val = (string)$rec->getValue();
-										$val = trim($val, "\" ");
-										if ($val !== '') $parts[] = $val;
-									}
-								}
-							}
-							$txt = $parts ? implode(' | ', $parts) : null;
-							$txtAccumMs += (int) round((microtime(true) - $start) * 1000);
-						}
-						if ($txt !== null && strlen($txt) > 1024) $txt = substr($txt, 0, 1024) . '…';
-						return ['txt' => $txt, 'txt_ms' => $txtAccumMs];
-					} finally {
-						if (isset($lock) && method_exists($lock, 'release')) { $lock->release(); }
-					}
-				});
-			}
-		}
-	}
-	if ($txtTasks) {
-		$txtOut = $awaitAll($txtTasks);
-		foreach ($txtOut as $i => $tRes) {
-			[$ip, $zoneDisplay] = $txtKeys[$i];
-			if (isset($results[$ip][$zoneDisplay])) {
-				$txt = is_array($tRes) ? ($tRes['txt'] ?? null) : null;
-				$txtMs = is_array($tRes) ? (int)($tRes['txt_ms'] ?? 0) : 0;
-				$results[$ip][$zoneDisplay]['txt'] = $txt;
-				$results[$ip][$zoneDisplay]['txt_ms'] = $txtMs;
-				$results[$ip][$zoneDisplay]['total_ms'] = (int)($results[$ip][$zoneDisplay]['total_ms'] ?? 0) + $txtMs;
-			}
-		}
-	}
-
-	return $results;
+function send_security_headers(bool $json): void {
+	header('Referrer-Policy: no-referrer');
+	header('X-Content-Type-Options: nosniff');
+	header('X-Frame-Options: DENY');
+	$mtime = @filemtime(__FILE__);
+	if ($mtime) header('X-App-Build: '.gmdate('c', (int)$mtime));
+	if ($json) return;
+	$nonce = csp_nonce();
+	$csp = [
+		"default-src 'none'",
+		"style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'",
+		"script-src 'self' https://cdn.jsdelivr.net 'nonce-".$nonce."'",
+		"img-src 'self' data:",
+		"font-src 'self' https://cdn.jsdelivr.net",
+		"connect-src 'self'",
+		"base-uri 'none'",
+		"form-action 'self'",
+		"frame-ancestors 'none'",
+	];
+	header('Content-Security-Policy: '.implode('; ', $csp));
 }
 
 // -------------------- Results summary (for JSON API) --------------------
@@ -1168,35 +842,12 @@ if ($queryInput !== '') {
 }
 
 $results = [];
-$parallelModeUsed = 'off';
-$parallelFallback = false;
 if ($queryInput !== '' && !$errors) {
-	if (should_use_amp_parallel()) {
-		$parallelModeUsed = 'amp';
-		$results = run_checks_amp($resolved['ips'], $zones, get_parallel_concurrency(), get_cache_ttl());
-		// If for any reason not all combinations are filled (e.g., resolver hiccup),
-		// fall back to fully sequential checks to guarantee completeness.
-		$completeInfoTmp = results_completeness($results, $zones, $resolved['ips']);
-		if (!$completeInfoTmp['complete']) {
-			$parallelFallback = true;
-			// Replace results with sequential to avoid mixed execution paths.
-			$results = [];
-			foreach (['ipv4','ipv6'] as $fam) {
-				foreach ($resolved['ips'][$fam] as $ip) {
-					foreach ($zones as $zoneDisplay) {
-						$zoneEff = map_zone_for_query($zoneDisplay);
-						$results[$ip][$zoneDisplay] = check_dnsbl($ip, $zoneEff);
-					}
-				}
-			}
-		}
-	} else {
-		foreach (['ipv4','ipv6'] as $fam) {
-			foreach ($resolved['ips'][$fam] as $ip) {
-				foreach ($zones as $zoneDisplay) {
-					$zoneEff = map_zone_for_query($zoneDisplay);
-					$results[$ip][$zoneDisplay] = check_dnsbl($ip, $zoneEff);
-				}
+	foreach (['ipv4','ipv6'] as $fam) {
+		foreach ($resolved['ips'][$fam] as $ip) {
+			foreach ($zones as $zoneDisplay) {
+				$zoneEff = map_zone_for_query($zoneDisplay);
+				$results[$ip][$zoneDisplay] = check_dnsbl($ip, $zoneEff);
 			}
 		}
 	}
@@ -1204,10 +855,7 @@ if ($queryInput !== '' && !$errors) {
 
 // -------------------- API (JSON) --------------------
 if ($queryInput !== '' && detect_wants_json()) {
-	send_security_headers(true);
-	// Emit diagnostic headers for troubleshooting parallel execution
-	header('X-Parallel-Mode: ' . $parallelModeUsed);
-	header('X-Parallel-Fallback: ' . ($parallelFallback ? '1' : '0'));
+    send_security_headers(true);
 	header('Content-Type: application/json; charset=utf-8');
     $completeInfo = results_completeness($results, $zones, $resolved['ips']);
 		echo json_encode([
@@ -1218,7 +866,6 @@ if ($queryInput !== '' && detect_wants_json()) {
 				'errors' => $errors,
 				'resolved_ips' => $resolved['ips'],
 		'results' => $results,
-		'parallel' => ['mode' => $parallelModeUsed, 'fallback' => $parallelFallback],
 	'summary' => build_results_summary($results, $zones),
 	'complete' => $completeInfo['complete'],
 	'expected_checks' => $completeInfo['expected'],
@@ -1228,9 +875,6 @@ if ($queryInput !== '' && detect_wants_json()) {
 }
 
 // -------------------- UI (HTML) --------------------
-// Emit diagnostic headers for troubleshooting parallel execution in HTML mode
-header('X-Parallel-Mode: ' . $parallelModeUsed);
-header('X-Parallel-Fallback: ' . ($parallelFallback ? '1' : '0'));
 send_security_headers(false);
 ?>
 <!doctype html>
@@ -1284,13 +928,7 @@ send_security_headers(false);
 							Disabled.
 						<?php endif; ?>
 					</div>
-					<div class="mb-2 small text-muted">
-						<strong>Parallel mode:</strong>
-						<span class="badge <?= $parallelModeUsed === 'amp' ? 'text-bg-primary' : 'text-bg-secondary' ?>"><?= h($parallelModeUsed) ?></span>
-						<?php if ($parallelFallback): ?>
-							<span class="ms-2 badge text-bg-warning">Fallback to sequential</span>
-						<?php endif; ?>
-					</div>
+                    
 					<div class="mb-3">
 						<label for="lookup" class="form-label">IP address or Domain</label>
 						<input type="text" class="form-control" id="lookup" name="lookup" placeholder="ip or domain" value="<?= h($queryInput) ?>" required>
