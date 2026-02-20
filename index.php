@@ -132,12 +132,15 @@ function dnsbl_query_name(string $ip, string $zone): ?string {
 function check_dnsbl(string $ip, string $zone): array {
 		$query = dnsbl_query_name($ip, $zone);
 		if ($query === null) {
-				return ['listed' => false, 'response' => null, 'txt' => null, 'query' => null, 'error' => 'invalid-ip'];
+				return ['listed' => false, 'response' => null, 'txt' => null, 'query' => null, 'error' => 'invalid-ip', 'a_ms' => 0, 'txt_ms' => 0, 'total_ms' => 0];
 		}
+	$overallStart = microtime(true);
 	// If a forced resolver is configured, try using dig against it first
 	$forced = get_forced_resolver();
 	if ($forced !== null && is_shell_exec_available()) {
+		$digStart = microtime(true);
 		[$resp, $txt] = dig_lookup_a_txt($query, $forced);
+		$digMs = (int) round((microtime(true) - $digStart) * 1000);
 		if ($resp !== null || $txt !== null) {
 			// Consider listed if an A response was returned
 			return [
@@ -146,17 +149,25 @@ function check_dnsbl(string $ip, string $zone): array {
 				'txt' => $txt,
 				'query' => redact_dqs_in_query($query),
 				'error' => null,
+				'a_ms' => null,
+				'txt_ms' => null,
+				'total_ms' => $digMs,
 			];
 		}
 		// fall through to system resolver if dig failed/unavailable
 	}
 
+	$tA1 = microtime(true);
 	$aRecords = @dns_get_record($query, DNS_A);
+	$aMs = (int) round((microtime(true) - $tA1) * 1000);
 	$listed = is_array($aRecords) && count($aRecords) > 0;
 	$response = $listed ? ($aRecords[0]['ip'] ?? null) : null;
 	$txt = null;
+	$txtMs = 0;
 	if ($listed) {
+		$tT1 = microtime(true);
 		$txtRecs = @dns_get_record($query, DNS_TXT);
+		$txtMs = (int) round((microtime(true) - $tT1) * 1000);
 		if (is_array($txtRecs) && count($txtRecs) > 0) {
 			// Some DNSBLs return multiple TXT strings; join them
 			$txtParts = [];
@@ -166,7 +177,8 @@ function check_dnsbl(string $ip, string $zone): array {
 			if ($txtParts) $txt = implode(' | ', $txtParts);
 		}
 	}
-	return ['listed' => $listed, 'response' => $response, 'txt' => $txt, 'query' => redact_dqs_in_query($query), 'error' => null];
+	$totalMs = $aMs + ($txtMs ?? 0);
+	return ['listed' => $listed, 'response' => $response, 'txt' => $txt, 'query' => redact_dqs_in_query($query), 'error' => null, 'a_ms' => $aMs, 'txt_ms' => $txtMs, 'total_ms' => $totalMs];
 }
 
 function get_default_dnsbls(): array {
@@ -502,6 +514,9 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 						'txt' => null,
 						'query' => redact_dqs_in_query($qname),
 						'error' => null,
+						'a_ms' => 0,
+						'txt_ms' => 0,
+						'total_ms' => 0,
 					];
 					continue;
 				}
@@ -510,7 +525,9 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 					$lock = $sem->acquire();
 					try {
 						$aIp = null;
+						$aMs = 0;
 						for ($attempt = 1; $attempt <= 2 && $aIp === null; $attempt++) {
+							$start = microtime(true);
 							try {
 								$recs = $dnsQuery($qname, \Amp\Dns\DnsRecord::A, new \Amp\TimeoutCancellation($timeoutMs));
 							} catch (\Throwable $e) {
@@ -523,9 +540,10 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 									if ($val !== '') $aIp = $val;
 								}
 							}
+							$aMs += (int) round((microtime(true) - $start) * 1000);
 						}
 						cache_set($ckey, $aIp ?? '', $cacheTtl);
-						return $aIp;
+						return ['aIp' => $aIp, 'a_ms' => $aMs];
 					} finally {
 						if (isset($lock) && method_exists($lock, 'release')) { $lock->release(); }
 					}
@@ -537,15 +555,20 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 	// Await all A lookups and populate results
 	if ($tasks) {
 		$out = $awaitAll($tasks);
-		foreach ($out as $i => $aIp) {
+			foreach ($out as $i => $aRes) {
 			[$ip, $zoneDisplay, $qname] = $keys[$i];
-			$results[$ip][$zoneDisplay] = [
-				'listed' => $aIp !== null,
-				'response' => $aIp,
-				'txt' => null,
-				'query' => redact_dqs_in_query($qname),
-				'error' => null,
-			];
+				$aIp = is_array($aRes) ? ($aRes['aIp'] ?? null) : (null);
+				$aMs = is_array($aRes) ? (int)($aRes['a_ms'] ?? 0) : 0;
+				$results[$ip][$zoneDisplay] = [
+					'listed' => $aIp !== null,
+					'response' => $aIp,
+					'txt' => null,
+					'query' => redact_dqs_in_query($qname),
+					'error' => null,
+					'a_ms' => $aMs,
+					'txt_ms' => 0,
+					'total_ms' => $aMs,
+				];
 		}
 	}
 
@@ -563,7 +586,9 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 					$lock = $sem->acquire();
 					try {
 						$txt = null;
+						$txtAccumMs = 0;
 						for ($attempt = 1; $attempt <= 2 && $txt === null; $attempt++) {
+							$start = microtime(true);
 							try {
 								$recs = $dnsQuery($qname, \Amp\Dns\DnsRecord::TXT, new \Amp\TimeoutCancellation($timeoutMs));
 							} catch (\Throwable $e) {
@@ -580,9 +605,10 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 								}
 							}
 							$txt = $parts ? implode(' | ', $parts) : null;
+							$txtAccumMs += (int) round((microtime(true) - $start) * 1000);
 						}
 						if ($txt !== null && strlen($txt) > 1024) $txt = substr($txt, 0, 1024) . '…';
-						return $txt;
+						return ['txt' => $txt, 'txt_ms' => $txtAccumMs];
 					} finally {
 						if (isset($lock) && method_exists($lock, 'release')) { $lock->release(); }
 					}
@@ -592,10 +618,14 @@ function run_checks_amp(array $ipsByFam, array $zonesDisplay, int $concurrency, 
 	}
 	if ($txtTasks) {
 		$txtOut = $awaitAll($txtTasks);
-		foreach ($txtOut as $i => $txt) {
+		foreach ($txtOut as $i => $tRes) {
 			[$ip, $zoneDisplay] = $txtKeys[$i];
 			if (isset($results[$ip][$zoneDisplay])) {
+				$txt = is_array($tRes) ? ($tRes['txt'] ?? null) : null;
+				$txtMs = is_array($tRes) ? (int)($tRes['txt_ms'] ?? 0) : 0;
 				$results[$ip][$zoneDisplay]['txt'] = $txt;
+				$results[$ip][$zoneDisplay]['txt_ms'] = $txtMs;
+				$results[$ip][$zoneDisplay]['total_ms'] = (int)($results[$ip][$zoneDisplay]['total_ms'] ?? 0) + $txtMs;
 			}
 		}
 	}
