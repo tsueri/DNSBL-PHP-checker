@@ -246,7 +246,7 @@ function dig_lookup_a_txt(string $qname, string $server): array {
 	if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $server)) return [null, null];
 	$serverArg = '@' . $server;
 	$qArg = escapeshellarg($qname);
-	$cmdA = "dig +time=2 +tries=1 +retry=0 +short $serverArg $qArg A 2>/dev/null";
+	$cmdA = "dig +time=3 +tries=1 +retry=0 +short $serverArg $qArg A 2>/dev/null";
 	$outA = @shell_exec($cmdA);
 	$aIp = null;
 	if (is_string($outA)) {
@@ -256,7 +256,7 @@ function dig_lookup_a_txt(string $qname, string $server): array {
 			if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6)) { $aIp = $line; break; }
 		}
 	}
-	$cmdT = "dig +time=2 +tries=1 +retry=0 +short $serverArg $qArg TXT 2>/dev/null";
+	$cmdT = "dig +time=3 +tries=1 +retry=0 +short $serverArg $qArg TXT 2>/dev/null";
 	$outT = @shell_exec($cmdT);
 	$txt = null;
 	if (is_string($outT) && trim($outT) !== '') {
@@ -279,7 +279,7 @@ function check_dnsbl(string $ip, string $zoneEff): array {
 	$qDisp = redact_dqs_in_query($qname);
 	$server = get_forced_resolver();
 	$aStart = microtime(true);
-	$aIp = null; $txt = null; $aMs = 0; $tMs = 0;
+	$aIp = null; $txt = null; $aMs = 0; $tMs = 0; $timeout = false;
 	if ($server) {
 		[$aIp, $txt] = dig_lookup_a_txt($qname, $server);
 		$aMs = (int) round((microtime(true) - $aStart) * 1000);
@@ -291,6 +291,10 @@ function check_dnsbl(string $ip, string $zoneEff): array {
 			$tMs = (int) round((microtime(true) - $ts) * 1000);
 			if ($txt2 !== null) $txt = $txt2;
 		}
+		// Timeout heuristic for forced resolver path: no data and near timeout budget
+		if ($aIp === null && $txt === null && $aMs >= 3000) {
+			$timeout = true;
+		}
 	} else {
 		$recs = @dns_get_record($qname, DNS_A);
 		if (is_array($recs) && $recs) {
@@ -299,6 +303,9 @@ function check_dnsbl(string $ip, string $zoneEff): array {
 			}
 		}
 		$aMs = (int) round((microtime(true) - $aStart) * 1000);
+		if ($aIp === null && $aMs >= 3000) {
+			$timeout = true;
+		}
 		if ($aIp !== null) {
 			$ts = microtime(true);
 			$txtRecs = @dns_get_record($qname, DNS_TXT);
@@ -313,12 +320,17 @@ function check_dnsbl(string $ip, string $zoneEff): array {
 		}
 	}
 	$total = $aMs + $tMs;
+	$err = null;
+	if ($timeout) {
+		$err = 'timeout';
+		if ($txt === null) { $txt = 'Timeout after 3s'; }
+	}
 	return [
 		'listed' => $aIp !== null,
 		'response' => $aIp,
 		'txt' => $txt,
 		'query' => $qDisp,
-		'error' => null,
+		'error' => $err,
 		'a_ms' => $aMs,
 		'txt_ms' => $tMs,
 		'total_ms' => $total,
@@ -811,7 +823,7 @@ function is_rate_limit_allowlisted(string $ip): bool {
 
 // -------------------- Controller --------------------
 // Reduce potential long-blocking DNS calls, but allow more time for first run
-@ini_set('default_socket_timeout', '5');
+@ini_set('default_socket_timeout', '3');
 @set_time_limit(30);
 
 $wantsJson = detect_wants_json();
@@ -1049,6 +1061,13 @@ send_security_headers(false);
 				<?php endif; ?>
 
 				<?php if ($results && $completeInfo['complete']): ?>
+					<div class="mb-3 small text-muted">
+						<strong>Status legend:</strong>
+						<span class="ms-2 result-listed">LISTED</span>
+						<span class="ms-2 result-clean">not listed</span>
+						<span class="ms-2 text-warning fw-semibold">unknown (timeout)</span>
+						<span class="ms-1">= DNSBL query timed out (~3s).</span>
+					</div>
 					<?php foreach ($results as $ip => $zonesResults): ?>
 						<div class="card mb-4 shadow-sm">
 							<div class="card-header d-flex justify-content-between align-items-center">
@@ -1081,7 +1100,9 @@ send_security_headers(false);
 											<?php $qv = $out['query'] ?? ''; if (is_array($qv)) { $qv = implode(' ', array_map('strval', $qv)); } else { $qv = (string)$qv; } ?>
 											<td class="text-muted small"><span class="dnsbl-zone"><?= h($qv) ?></span></td>
 											<td>
-												<?php if ($out['listed']): ?>
+												<?php if (!empty($out['error']) && $out['error'] === 'timeout'): ?>
+													<span class="text-warning fw-semibold">unknown (timeout)</span>
+												<?php elseif ($out['listed']): ?>
 													<span class="result-listed">LISTED</span>
 												<?php else: ?>
 													<span class="result-clean">not listed</span>
