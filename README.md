@@ -58,6 +58,7 @@ Config keys (array returned by `config.php`):
 - `ALLOW_CUSTOM_ZONES`: When `true`, users may override zones via `dnsbl[]` query. When `false`, the app uses only configured/default zones.
 - `FORCE_DNSBL_ZONES`: When `true`, always ignore `dnsbl[]` query and use only configured/default zones (overrides `ALLOW_CUSTOM_ZONES`).
 - `SPAMHAUS_DQS_KEY`: Spamhaus DQS key. When set, the app maps common Spamhaus zones to DQS (e.g., `zen.spamhaus.org` → `<key>.zen.dq.spamhaus.net`). The key is redacted in displayed queries.
+  - If you list `*.dq.spamhaus.net` zones without a key prefix (e.g., `dbl.dq.spamhaus.net`) the app will automatically prefix them with your key: `<key>.dbl.dq.spamhaus.net`.
 - `DNSBL_RESOLVER`: Force all DNS queries through a specific resolver (e.g., `127.0.0.1`). Useful to ensure queries do not go through public/open resolvers.
 - `PARALLEL_MODE`: `'amp'` to enable Amp-based parallel DNS, `'off'` for sequential (default `'off'`). Automatically disabled if `DNSBL_RESOLVER` is set.
 - `PARALLEL_CONCURRENCY`: Max concurrent DNS tasks when in Amp mode (1–32, default `6`).
@@ -133,6 +134,7 @@ Response (example):
   - Get a key from Spamhaus DQS
   - Configure `SPAMHAUS_DQS_KEY` in `config.php` or as an env var
   - Query the app as usual; the mapping happens internally.
+  - If you configure `zen.spamhaus.org`, `pbl.spamhaus.org`, `sbl-xbl.spamhaus.org`, `sbl.spamhaus.org`, `xbl.spamhaus.org`, `dbl.spamhaus.org`, or `zrd.spamhaus.org`, they are automatically mapped to the DQS hostname with your key.
 
 ## Local Resolver (Recommended)
 Use a local, closed recursive resolver (e.g., Unbound) so DNSBL queries originate from your server and not a public/open resolver. Point your OS (or `DNSBL_RESOLVER`) to the local resolver. Avoid public/open resolvers for DNSBL use.

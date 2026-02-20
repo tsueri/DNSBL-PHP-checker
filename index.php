@@ -364,16 +364,27 @@ function allow_custom_zones(): bool {
 function map_zone_for_query(string $zone): string {
 	$key = get_spamhaus_dqs_key();
 	if ($key === null) return $zone;
-	// If user already provided a dq.spamhaus.net zone, do not modify
-	if (stripos($zone, '.dq.spamhaus.net') !== false) return $zone;
-	$z = strtolower($zone);
-	// Map common Spamhaus zones to DQS when a key is present
+	$z = strtolower(trim($zone, '.'));
+	// If zone is already a DQS host but missing the key prefix, add it
+	if (str_ends_with($z, '.dq.spamhaus.net')) {
+		// If it already begins with the key., leave unchanged
+		if (stripos($z, strtolower($key) . '.') === 0) return $z;
+		return $key . '.' . $z;
+	}
+	// Map common Spamhaus .org zones to their DQS equivalents
 	$map = [
-		'zen.spamhaus.org' => "$key.zen.dq.spamhaus.net",
-		'pbl.spamhaus.org' => "$key.pbl.dq.spamhaus.net",
-		'sbl-xbl.spamhaus.org' => "$key.sbl-xbl.dq.spamhaus.net",
+		'zen.spamhaus.org' => 'zen.dq.spamhaus.net',
+		'pbl.spamhaus.org' => 'pbl.dq.spamhaus.net',
+		'sbl-xbl.spamhaus.org' => 'sbl-xbl.dq.spamhaus.net',
+		'sbl.spamhaus.org' => 'sbl.dq.spamhaus.net',
+		'xbl.spamhaus.org' => 'xbl.dq.spamhaus.net',
+		'dbl.spamhaus.org' => 'dbl.dq.spamhaus.net',
+		'zrd.spamhaus.org' => 'zrd.dq.spamhaus.net',
 	];
-	return $map[$z] ?? $zone;
+	if (isset($map[$z])) {
+		return $key . '.' . $map[$z];
+	}
+	return $z;
 }
 
 function redact_dqs_in_query(string $s): string {
