@@ -516,9 +516,9 @@ function enforce_access_allowlist(bool $wantsJson): void {
 	} else {
 		echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
 		echo '<link href="css/bootstrap.min.css" rel="stylesheet">';
-		echo '<title>Forbidden</title></head><body class="p-4"><div class="container">';
+		echo '<title>Forbidden</title></head><body class="p-4"><main id="main-content" class="container">';
 		echo '<div class="alert alert-danger">Access restricted to allowlisted IPs. Your IP: '.h($ip).'</div>';
-		echo '</div></body></html>';
+		echo '</main></body></html>';
 	}
 	exit;
 }
@@ -697,9 +697,9 @@ function enforce_rate_limit(bool $wantsJson, bool $hasLookup): void {
 	// Minimal HTML response
 	echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
 	echo '<link href="css/bootstrap.min.css" rel="stylesheet">';
-	echo '<title>Too Many Requests</title></head><body class="p-4"><div class="container"><div class="alert alert-warning">';
+	echo '<title>Too Many Requests</title></head><body class="p-4"><main id="main-content" class="container"><div class="alert alert-warning">';
 	echo 'Too many requests from your IP. Try again in '.h((string)$retry).'s.';
-	echo '</div><a class="btn btn-secondary" href="/">Back</a></div></body></html>';
+	echo '</div><a class="btn btn-secondary" href="/">Back</a></main></body></html>';
 	exit;
 }
 
@@ -936,7 +936,7 @@ send_security_headers(false);
 	<meta name="description" content="Check an IP address or domain against common DNS blocklists (DNSBLs) to see if it's listed for spam or abuse.">
 </head>
 <body>
-<div class="container">
+<main id="main-content" class="container">
 	<div class="row justify-content-center">
 		<div class="col-lg-9">
 			<h1 class="mb-3">DNSBL Checker</h1>
@@ -1137,6 +1137,7 @@ send_security_headers(false);
 		</div>
 	</div>
 </div>
+</main>
 <script src="js/bootstrap.bundle.min.js"></script>
 <script nonce="<?= h(csp_nonce()) ?>">
 (function(){
