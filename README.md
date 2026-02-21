@@ -1,6 +1,6 @@
 # DNSBL PHP Checker
 
-A single-file PHP app to check an IP address (IPv4/IPv6) or domain against common DNS blocklists (DNSBL). Includes a clean Bootstrap UI and a simple GET-based API.
+A single-file PHP app to check an IP address (IPv4/IPv6) or domain against common DNS blocklists (DNSBL). Includes a clean Bootstrap UI and a simple GET-based API. Start testing [here](https://dnsbl.campa.tools/).
 
 ## Features
 - Validates IPv4, IPv6, or domain (IDN-aware when `intl` is available)
@@ -29,7 +29,7 @@ php -S localhost:8000
 - GET API (JSON): `/?lookup=8.8.8.8&format=json`
 - Choose DNSBLs:
   - UI checkboxes (defaults provided)
-  - GET: `&dnsbl[]=zen.spamhaus.org&dnsbl[]=dnsbl.sorbs.net`
+  - GET: `&dnsbl[]=zen.spamhaus.org&dnsbl[]=zen.spamhaus.org`
 
 Example:
 ```bash
