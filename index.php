@@ -973,7 +973,7 @@ send_security_headers(false);
                     
 					<div class="mb-3">
 						<label for="lookup" class="form-label">IP address or Domain</label>
-						<input type="text" class="form-control" id="lookup" name="lookup" placeholder="ip or domain" value="<?= h($queryInput) ?>" required>
+						<input type="text" class="form-control" id="lookup" name="lookup" placeholder="e.g. 1.1.1.1 or mail.yourserver.com" value="<?= h($queryInput) ?>" required>
 						<div class="form-text">Domains will be resolved to A (IPv4) and AAAA (IPv6) and each IP will be checked.</div>
 					</div>
 
