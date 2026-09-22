@@ -12,7 +12,7 @@ A single-file PHP app to check an IP address (IPv4/IPv6) or domain against commo
 - JSON summary with totals and per-IP/per-zone breakdowns
 - Basic security headers and sane DNS timeouts
 - Optional per-IP rate limiting (default: 10 requests/hour via APCu or file fallback)
-- Lightweight caching for A-record responses (APCu preferred, file fallback)
+- Lightweight caching for A/AAAA answers, positive and negative (APCu preferred, file fallback)
 
 ## Quickstart
 Requirements: PHP 8+ with DNS access from the host; outbound UDP/TCP 53 to your resolver.
@@ -58,8 +58,9 @@ Config keys (array returned by `config.php`):
 - `SPAMHAUS_DQS_KEY`: Spamhaus DQS key. When set, the app maps common Spamhaus zones to DQS (e.g., `zen.spamhaus.org` → `<key>.zen.dq.spamhaus.net`). The key is redacted in displayed queries.
   - If you list `*.dq.spamhaus.net` zones without a key prefix (e.g., `dbl.dq.spamhaus.net`) the app will automatically prefix them with your key: `<key>.dbl.dq.spamhaus.net`.
 - `DNSBL_RESOLVER`: Force all DNS queries through a specific resolver (e.g., `127.0.0.1`). Useful to ensure queries do not go through public/open resolvers.
-- `DNS_TIMEOUT_MS`: Per-DNS operation timeout in milliseconds (100–30000, default `5000`).
-- `CACHE_TTL`: Seconds to cache A answers (default `300`). Cached empty string means “not listed”.
+- `DNSBL_ZONE_ALLOWLIST`: Optional array/comma-separated list restricting zones passed via `dnsbl[]`; other zones are ignored (defaults still apply when none remain). Recommended for public deployments.
+- `DNS_TIMEOUT_MS`: Per-DNS operation timeout in milliseconds for the forced dig resolver (100–30000, default `3000`). The native resolver is governed by the OS resolver configuration.
+- `CACHE_TTL`: Seconds to cache A/AAAA answers, positive and negative (default `300`, `0` disables, max `86400`). Failures/timeouts are never cached; TXT is not cached.
 - `RATE_LIMIT_IP_ALLOWLIST`: Optional array of IPs/CIDRs that bypass rate limiting (e.g., `["127.0.0.1", "::1", "10.0.0.0/8"]).
 - `ADMIN_API_TOKEN`: Strong secret to enable admin endpoints (e.g., rate-limit reset). Leave empty to disable admin API.
 - `ACCESS_ALLOW_ONLY_ALLOWLIST`: When `true`, only IPs/CIDRs in the allowlist can use the app; others get HTTP 403.
@@ -70,6 +71,7 @@ Environment variable equivalents:
 - `FORCE_DNSBL_ZONES` (true/false)
 - `SPAMHAUS_DQS_KEY` or `SPAMHAUS_DQS`
 - `DNSBL_RESOLVER` or `DNSBL_NAMESERVER`
+- `DNSBL_ZONE_ALLOWLIST` (comma-separated)
 - `DNS_TIMEOUT_MS`, `CACHE_TTL`
 - `RATE_LIMIT_ALLOWLIST` (comma-separated IPs/CIDRs)
 - `ADMIN_API_TOKEN`
@@ -78,10 +80,10 @@ Environment variable equivalents:
 The app reads `config.php` first, then falls back to environment variables.
 
 ### Execution Model
-All DNSBL checks run sequentially. Each A lookup and (when listed) TXT lookup has its own timeout (`DNS_TIMEOUT_MS`), and per-result timing fields (`a_ms`, `txt_ms`, `total_ms`) are included in the JSON output.
+All DNSBL checks run sequentially. A/AAAA answers are served from the answer cache when present (`CACHE_TTL`); resolver failures are never cached. Each A lookup and (when listed) TXT lookup has its own timeout (`DNS_TIMEOUT_MS` for the forced dig resolver), and per-result timing fields (`a_ms`, `txt_ms`, `total_ms`) are included in the JSON output.
 
 ### Rate Limiting
-Per-IP rate limiting is enabled by default: 10 requests per hour. It uses APCu when available; otherwise, it falls back to a lock file in the system temp directory.
+Per-IP rate limiting is enabled by default: 10 requests per hour. IPv6 clients are keyed by /64 prefix, so addresses inside one prefix share a budget. It uses APCu when available; otherwise, it falls back to a lock file in the system temp directory.
 
 Config keys:
 - `RATE_LIMIT_ENABLED`: `true|false` (default `true`)
@@ -128,6 +130,30 @@ Response (example):
 
 ## Local Resolver (Recommended)
 Use a local, closed recursive resolver (e.g., Unbound) so DNSBL queries originate from your server and not a public/open resolver. Point your OS (or `DNSBL_RESOLVER`) to the local resolver. Avoid public/open resolvers for DNSBL use.
+
+## Public Deployment Hardening
+The app is unauthenticated by design, so treat it as an open service and cap its abuse potential:
+
+- Restrict zone overrides: set `FORCE_DNSBL_ZONES: true` (always use the default zones) or `DNSBL_ZONE_ALLOWLIST` (permits only known zones). Otherwise anyone can point checks at arbitrary zones, using your resolver's query budget.
+- Keep `ADMIN_API_TOKEN` empty unless you use the admin endpoint; when set, pass it via the query string only over TLS and rotate it if it leaks into logs.
+- Cap request rates at the edge in addition to the app limiter, e.g. nginx:
+  ```nginx
+  # http context
+  limit_req_zone $binary_remote_addr zone=dnsbl:10m rate=30r/m;
+
+  server {
+      # server/location context
+      limit_req zone=dnsbl burst=10 nodelay;
+
+      location ~ ^/(tests|docs)/ { deny all; }
+      location ~* \.md$ { deny all; }
+      location = /config.example.php { deny all; }
+      location ~ /\.(?!well-known) { deny all; }
+  }
+  ```
+- Keep `config.php` (DQS key, admin token) in the webroot only if the PHP handler is guaranteed; ensure no `config.php.bak`, `config.php~`, or editor swap files are deployed.
+- If you enable `TRUST_PROXY`, make sure the reverse proxy overwrites `X-Forwarded-For` (the app reads the first hop); otherwise rate limiting and allowlists can be spoofed.
+- Caching (`CACHE_TTL`) is on by default and absorbs repeated checks of the same names; raise it if you expect bursts against the same IPs.
 
 ## API Examples
 ```bash
@@ -184,8 +210,8 @@ curl -s "http://localhost:8000/?lookup=8.8.8.8&dnsbl[]=zen.spamhaus.org&dnsbl[]=
 - All HTML output is escaped.
 - Security headers: CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy.
 - Sane limits: `lookup` length capped; max 15 DNSBL zones per request.
-- Timeouts: socket default ~5s; script time limit ~30s; per-DNS op timeout configurable via `DNS_TIMEOUT_MS`.
-- Caching: A-record responses are cached for `CACHE_TTL` seconds (APCu preferred, file fallback). TXT is not cached.
+- Timeouts: script time limit ~30s; per-DNS op timeout configurable via `DNS_TIMEOUT_MS` (forced dig resolver). The native resolver uses OS resolver timeouts (~5s per query).
+- Caching: A/AAAA answers are cached for `CACHE_TTL` seconds (APCu preferred, file fallback, 0700 directory / 0600 files). Failures are not cached; TXT is not cached.
 
 ## Notes
 - Some DNSBL providers (e.g., Barracuda) may require registration and will return NXDOMAIN/empty answers until allowed.

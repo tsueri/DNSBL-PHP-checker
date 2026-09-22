@@ -43,6 +43,22 @@ final class InMemoryResolver implements DnsResolver {
 	}
 }
 
+final class InMemoryAnswerCache implements AnswerCache {
+	/** @var array<string, array{records: list<string>, status: string}> */
+	public array $store = [];
+	/** @var list<array{key: string, ttl: int}> */
+	public array $sets = [];
+
+	public function get(string $key): ?array {
+		return $this->store[$key] ?? null;
+	}
+
+	public function set(string $key, array $answer, int $ttl): void {
+		$this->sets[] = ['key' => $key, 'ttl' => $ttl];
+		$this->store[$key] = $answer;
+	}
+}
+
 $GLOBALS['__checks'] = 0;
 $GLOBALS['__failures'] = 0;
 
@@ -82,9 +98,41 @@ assert_same('queries AAAA through the resolver', ['example.com'], $dns->queryNam
 
 // --- Resolver factory honours the forced resolver ---
 putenv('DNSBL_RESOLVER=127.0.0.1');
+putenv('CACHE_TTL=0');
 assert_same('forced resolver selects DigResolver', DigResolver::class, get_class(dns_resolver()));
 putenv('DNSBL_RESOLVER');
 assert_same('no forced resolver selects NativeResolver', NativeResolver::class, get_class(dns_resolver()));
+putenv('CACHE_TTL');
+putenv('CACHE_TTL=300');
+assert_same('caching wraps the resolver when a ttl is set', CachedResolver::class, get_class(dns_resolver()));
+putenv('CACHE_TTL');
+
+// --- DNS timeout config ---
+putenv('DNS_TIMEOUT_MS=12000');
+assert_same('dns timeout is configurable', 12000, get_dns_timeout_ms());
+putenv('DNS_TIMEOUT_MS=1');
+assert_same('dns timeout is clamped to 100ms', 100, get_dns_timeout_ms());
+putenv('DNS_TIMEOUT_MS=999999');
+assert_same('dns timeout is capped at 30000ms', 30000, get_dns_timeout_ms());
+putenv('DNS_TIMEOUT_MS');
+assert_same('dns timeout defaults to 3000ms', 3000, get_dns_timeout_ms());
+
+// --- Zone allowlist ---
+putenv('DNSBL_ZONE_ALLOWLIST=zen.spamhaus.org, bl.spamcop.net');
+$_GET['dnsbl'] = ['evil.example', 'zen.spamhaus.org'];
+assert_same('zone allowlist keeps permitted custom zones', ['zen.spamhaus.org'], parse_dnsbls_from_get());
+$_GET['dnsbl'] = ['evil.example'];
+assert_same('zone allowlist falls back to defaults', get_default_dnsbls(), parse_dnsbls_from_get());
+putenv('DNSBL_ZONE_ALLOWLIST');
+$_GET['dnsbl'] = ['zen.spamhaus.org'];
+assert_same('without an allowlist custom zones pass', ['zen.spamhaus.org'], parse_dnsbls_from_get());
+unset($_GET['dnsbl']);
+
+// --- Rate limit subject (IPv6 /64) ---
+assert_same('ipv4 subject is the address', '1.2.3.4', rate_limit_subject('1.2.3.4'));
+assert_same('ipv6 addresses in one /64 share a subject', rate_limit_subject('2001:db8::1'), rate_limit_subject('2001:db8::beef'));
+assert_same('different ipv6 /64s get different subjects', false, rate_limit_subject('2001:db8:0:1::1') === rate_limit_subject('2001:db8::1'));
+assert_same('ipv4-mapped ipv6 maps to the ipv4 subject', '1.2.3.4', rate_limit_subject('::ffff:1.2.3.4'));
 
 // --- Checks through the seam ---
 $dns = new InMemoryResolver();
@@ -131,6 +179,39 @@ $check = check_dnsbl($dns, '1.2.3.4', 'zen.spamhaus.org');
 assert_same('resolver failure reports dns_error', 'dns_error', $check['error']);
 assert_same('resolver failure reports its own txt', 'DNS query failed', $check['txt']);
 assert_same('failed check is not listed', false, $check['listed']);
+
+// --- Answer cache ---
+$inner = new InMemoryResolver();
+$inner->set('4.3.2.1.zen.spamhaus.org', DNS_A, ['127.0.0.2']);
+$cache = new InMemoryAnswerCache();
+$dns = new CachedResolver($inner, $cache, 300);
+$first = $dns->query('4.3.2.1.zen.spamhaus.org', DNS_A);
+$second = $dns->query('4.3.2.1.zen.spamhaus.org', DNS_A);
+assert_same('cached resolver returns the inner answer', ['records' => ['127.0.0.2'], 'status' => 'ok'], $first);
+assert_same('cached resolver serves the second lookup from cache', $first, $second);
+assert_same('cache hit avoids the inner query', 1, count($inner->queryNamesOfType(DNS_A)));
+assert_same('ok answers are stored with the ttl', 300, $cache->sets[0]['ttl']);
+
+$inner = new InMemoryResolver();
+$inner->status = 'timeout';
+$cache = new InMemoryAnswerCache();
+$dns = new CachedResolver($inner, $cache, 300);
+$dns->query('4.3.2.1.zen.spamhaus.org', DNS_A);
+$dns->query('4.3.2.1.zen.spamhaus.org', DNS_A);
+assert_same('resolver failures are not cached', 2, count($inner->queryNamesOfType(DNS_A)));
+assert_same('resolver failures write nothing to cache', 0, count($cache->sets));
+
+$inner = new InMemoryResolver();
+$cache = new InMemoryAnswerCache();
+$dns = new CachedResolver($inner, $cache, 300);
+$dns->query('4.3.2.1.zen.spamhaus.org', DNS_TXT);
+assert_same('TXT answers are not cached', 0, count($cache->sets));
+
+$inner = new InMemoryResolver();
+$cache = new InMemoryAnswerCache();
+$dns = new CachedResolver($inner, $cache, 0);
+$dns->query('4.3.2.1.zen.spamhaus.org', DNS_A);
+assert_same('zero ttl disables caching', 0, count($cache->sets));
 
 // --- Return-code classification ---
 assert_same(

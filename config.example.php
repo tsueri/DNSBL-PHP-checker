@@ -36,12 +36,20 @@ return [
     'ALLOW_CUSTOM_ZONES' => true,
     // Force using only the configured/default zones and ignore GET overrides
     'FORCE_DNSBL_ZONES' => false,
+    // Optional allowlist for zones supplied via ?dnsbl[]. When set, other
+    // zones are ignored (built-in defaults still apply when none remain).
+    // Recommended for public deployments.
+    'DNSBL_ZONE_ALLOWLIST' => [
+        // 'zen.spamhaus.org',
+        // 'pbl.spamhaus.org',
+        // 'b.barracudacentral.org',
+        // 'bl.spamcop.net',
+        // 'multi.surbl.org',
+    ],
 
-    // Parallelization and caching
-    // Use AMP-based parallel DNS (requires Composer dependencies installed)
-    'PARALLEL_MODE' => 'off', // 'amp' or 'off'
-    'PARALLEL_CONCURRENCY' => 6,
-    // Cache positive/negative A answers per query name to reduce load
+    // Per-DNS-operation timeout in ms for the forced dig resolver (100-30000)
+    'DNS_TIMEOUT_MS' => 3000,
+    // Cache A/AAAA answers (positive and negative) per query name; 0 disables
     'CACHE_TTL' => 300, // seconds
 
     // Rate limiting (defaults: enabled, 60s)

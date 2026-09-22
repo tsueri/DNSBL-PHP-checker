@@ -125,8 +125,24 @@ function allow_custom_zones(): bool {
 	if ($force !== null && filter_var((string)$force, FILTER_VALIDATE_BOOLEAN)) {
 		return false;
 	}
-	$allow = $cfg['ALLOW_CUSTOM_ZONES'] ?? getenv('ALLOW_CUSTOM_ZONES') ?? '1';
+	$allow = $cfg['ALLOW_CUSTOM_ZONES'] ?? getenv('ALLOW_CUSTOM_ZONES');
+	if ($allow === null || $allow === false || $allow === '') return true;
 	return filter_var((string)$allow, FILTER_VALIDATE_BOOLEAN);
+}
+
+// Optional allowlist for zones passed via ?dnsbl[]. Empty means any valid
+// zone is accepted (the historical default).
+function get_zone_allowlist(): array {
+	$cfg = load_app_config();
+	$raw = $cfg['DNSBL_ZONE_ALLOWLIST'] ?? getenv('DNSBL_ZONE_ALLOWLIST') ?? null;
+	if ($raw === null || $raw === false || $raw === '') return [];
+	$items = is_string($raw) ? explode(',', $raw) : (is_array($raw) ? $raw : []);
+	$out = [];
+	foreach ($items as $z) {
+		$z = strtolower(trim((string)$z, ". \t"));
+		if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) $out[] = $z;
+	}
+	return array_values(array_unique($out));
 }
 
 function get_spamhaus_dqs_key(): ?string {
@@ -191,6 +207,10 @@ function parse_dnsbls_from_get(): array {
 			if ($z !== '' && strlen($z) <= 253 && is_valid_domain($z)) $zones[] = $z;
 		}
 	}
+	$allowlist = get_zone_allowlist();
+	if ($zones && $allowlist) {
+		$zones = array_values(array_intersect($zones, $allowlist));
+	}
 	if (!$zones) $zones = get_default_dnsbls();
 	$zones = array_values(array_unique($zones));
 	if (count($zones) > 15) $zones = array_slice($zones, 0, 15);
@@ -206,6 +226,18 @@ function get_forced_resolver(): ?string {
 		return $v;
 	}
 	return null;
+}
+
+// Per-DNS-operation timeout for the forced dig resolver. The native resolver
+// is governed by the OS resolver configuration instead.
+function get_dns_timeout_ms(): int {
+	$cfg = load_app_config();
+	$v = $cfg['DNS_TIMEOUT_MS'] ?? getenv('DNS_TIMEOUT_MS');
+	if ($v === null || $v === false || $v === '') return 3000;
+	$t = (int)$v;
+	if ($t < 100) $t = 100;
+	if ($t > 30000) $t = 30000;
+	return $t;
 }
 
 // -------------------- Resolver seam --------------------
@@ -233,7 +265,7 @@ final class NativeResolver implements DnsResolver {
 }
 
 final class DigResolver implements DnsResolver {
-	public function __construct(private string $server) {}
+	public function __construct(private string $server, private int $timeoutSec = 3) {}
 
 	public function query(string $name, int $type): array {
 		$failure = ['records' => [], 'status' => 'error'];
@@ -248,7 +280,8 @@ final class DigResolver implements DnsResolver {
 		if ($typeArg === null) return $failure;
 		// Append dig's exit status: 0 = answer (incl. NXDOMAIN), 9 = no answer,
 		// anything else = local failure. This separates "not listed" from "unknown".
-		$cmd = "dig +time=3 +tries=1 +retry=0 +short @{$this->server} " . escapeshellarg($name) . " {$typeArg} 2>/dev/null; printf '\\n__dig_status:%d' $?";
+		$timeoutSec = max(1, $this->timeoutSec);
+		$cmd = "dig +time={$timeoutSec} +tries=1 +retry=0 +short @{$this->server} " . escapeshellarg($name) . " {$typeArg} 2>/dev/null; printf '\\n__dig_status:%d' $?";
 		$out = @shell_exec($cmd);
 		if (!is_string($out)) return $failure;
 		$status = 'ok';
@@ -279,9 +312,105 @@ final class DigResolver implements DnsResolver {
 	}
 }
 
+// -------------------- A/AAAA answer cache --------------------
+// Cached by query name and type; resolver failures are never cached and TXT
+// is not cached. APCu when available, a file under the system temp dir
+// otherwise. CACHE_TTL = 0 disables caching.
+interface AnswerCache {
+	/** @return ?array{records: list<string>, status: string} */
+	public function get(string $key): ?array;
+	/** @param array{records: list<string>, status: string} $answer */
+	public function set(string $key, array $answer, int $ttl): void;
+}
+
+final class ApcuAnswerCache implements AnswerCache {
+	public function get(string $key): ?array {
+		$v = @apcu_fetch($key, $ok);
+		return ($ok && is_array($v)) ? $v : null;
+	}
+	public function set(string $key, array $answer, int $ttl): void {
+		@apcu_store($key, $answer, $ttl);
+	}
+}
+
+final class FileAnswerCache implements AnswerCache {
+	public function __construct(private string $dir) {}
+
+	private function path(string $key): string {
+		return $this->dir . '/' . hash('sha256', $key) . '.json';
+	}
+
+	public function get(string $key): ?array {
+		$path = $this->path($key);
+		$raw = @file_get_contents($path);
+		if (!is_string($raw) || $raw === '') return null;
+		$data = json_decode($raw, true);
+		if (!is_array($data) || !isset($data['expires'], $data['answer']) || !is_array($data['answer'])) return null;
+		if ((int)$data['expires'] < time()) { @unlink($path); return null; }
+		$answer = $data['answer'];
+		if (!isset($answer['records'], $answer['status']) || !is_array($answer['records']) || !is_string($answer['status'])) return null;
+		return ['records' => array_values(array_map('strval', $answer['records'])), 'status' => $answer['status']];
+	}
+
+	public function set(string $key, array $answer, int $ttl): void {
+		if (!is_dir($this->dir)) @mkdir($this->dir, 0700, true);
+		$payload = json_encode(['expires' => time() + $ttl, 'answer' => $answer]);
+		if ($payload === false) return;
+		$path = $this->path($key);
+		@file_put_contents($path, $payload, LOCK_EX);
+		@chmod($path, 0600);
+	}
+}
+
+final class NullAnswerCache implements AnswerCache {
+	public function get(string $key): ?array { return null; }
+	public function set(string $key, array $answer, int $ttl): void {}
+}
+
+final class CachedResolver implements DnsResolver {
+	public function __construct(private DnsResolver $inner, private AnswerCache $cache, private int $ttl) {}
+
+	public function query(string $name, int $type): array {
+		if ($this->ttl <= 0 || $type === DNS_TXT) return $this->inner->query($name, $type);
+		$key = 'dnsblac:' . $name . '|' . $type;
+		$hit = $this->cache->get($key);
+		if ($hit !== null) return $hit;
+		$answer = $this->inner->query($name, $type);
+		if ($answer['status'] === 'ok') $this->cache->set($key, $answer, $this->ttl);
+		return $answer;
+	}
+}
+
+function get_cache_ttl(): int {
+	$cfg = load_app_config();
+	$v = $cfg['CACHE_TTL'] ?? getenv('CACHE_TTL');
+	if ($v === null || $v === false || $v === '') return 300;
+	$t = (int)$v;
+	if ($t < 0) $t = 0;
+	if ($t > 86400) $t = 86400;
+	return $t;
+}
+
+function answer_cache(): AnswerCache {
+	static $cache = null;
+	if ($cache !== null) return $cache;
+	$apcuOn = function_exists('apcu_fetch') && filter_var(ini_get('apcu.enabled') ?: ini_get('apc.enabled') ?: '0', FILTER_VALIDATE_BOOLEAN);
+	if ($apcuOn) { $cache = new ApcuAnswerCache(); return $cache; }
+	$dir = rtrim(sys_get_temp_dir(), '/') . '/dnsbl_php_checker_cache';
+	if (is_link($dir)) { $cache = new NullAnswerCache(); return $cache; }
+	$cache = new FileAnswerCache($dir);
+	return $cache;
+}
+
 function dns_resolver(): DnsResolver {
 	$server = get_forced_resolver();
-	return $server !== null ? new DigResolver($server) : new NativeResolver();
+	if ($server !== null) {
+		$base = new DigResolver($server, (int)ceil(get_dns_timeout_ms() / 1000));
+	} else {
+		$base = new NativeResolver();
+	}
+	$ttl = get_cache_ttl();
+	return $ttl > 0 ? new CachedResolver($base, answer_cache(), $ttl) : $base;
 }
 
 function dnsbl_query_name(string $ip, string $zone): ?string {
@@ -509,6 +638,21 @@ function get_client_ip(): string {
 	return is_string($remote) && $remote !== '' ? $remote : 'unknown';
 }
 
+/**
+ * Rate limit subject for an IP: IPv4 as-is, IPv6 masked to its /64 so one
+ * client cannot rotate addresses inside its prefix to bypass the limit.
+ */
+function rate_limit_subject(string $ip): string {
+	if (str_starts_with($ip, '::ffff:')) {
+		$v4 = substr($ip, 7);
+		if (filter_var($v4, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) return $v4;
+	}
+	$bin = @inet_pton($ip);
+	if ($bin === false || strlen($bin) !== 16) return $ip;
+	$masked = @inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8));
+	return is_string($masked) ? $masked . '/64' : $ip;
+}
+
 function is_rate_limit_enabled(): bool {
 	$cfg = load_app_config();
 	$v = $cfg['RATE_LIMIT_ENABLED'] ?? getenv('RATE_LIMIT_ENABLED');
@@ -597,7 +741,7 @@ function admin_require_token(): void {
 }
 
 function rate_limit_reset_for_ip(string $ip): array {
-	$keyBase = 'dnsblrl:' . hash('sha256', $ip);
+	$keyBase = 'dnsblrl:' . hash('sha256', rate_limit_subject($ip));
 	$apcuOn = function_exists('apcu_delete') && filter_var(ini_get('apcu.enabled') ?: ini_get('apc.enabled') ?: '0', FILTER_VALIDATE_BOOLEAN);
 	if ($apcuOn) {
 		$tsKey = $keyBase . ':ts';
@@ -608,12 +752,12 @@ function rate_limit_reset_for_ip(string $ip): array {
 	}
 	$dir = rtrim(sys_get_temp_dir(), '/').'/dnsbl_php_checker_rl';
 	if (is_link($dir)) {
-    // Fail-open if path is a symlink
-    return [true, 0];
-}
-if (!is_dir($dir)) {
-    @mkdir($dir, 0700, true);
-}
+		// Fail-open if path is a symlink
+		return ['backend' => 'file', 'removed' => false, 'error' => 'symlink'];
+	}
+	if (!is_dir($dir)) {
+		@mkdir($dir, 0700, true);
+	}
 	$path = $dir.'/'.substr($keyBase, 7).'.dat';
 	$ok = @unlink($path);
 	return ['backend' => 'file', 'removed' => $ok, 'path' => $path];
@@ -624,7 +768,7 @@ if (!is_dir($dir)) {
  */
 function rate_limit_check_and_consume(int $window): array {
 	$ip = get_client_ip();
-	$key = 'dnsblrl:' . hash('sha256', $ip);
+	$key = 'dnsblrl:' . hash('sha256', rate_limit_subject($ip));
 	$now = time();
 	$limit = get_rate_limit_count();
 
@@ -755,7 +899,7 @@ function enforce_rate_limit(bool $wantsJson, bool $hasLookup): void {
 function rate_limit_peek_status(int $window, int $limit): array {
 	$ip = get_client_ip();
 	if (is_rate_limit_allowlisted($ip)) return ['remaining' => $limit, 'resetIn' => 0];
-	$key = 'dnsblrl:' . hash('sha256', $ip);
+	$key = 'dnsblrl:' . hash('sha256', rate_limit_subject($ip));
 	$now = time();
 	$apcuOn = function_exists('apcu_fetch') && filter_var(ini_get('apcu.enabled') ?: ini_get('apc.enabled') ?: '0', FILTER_VALIDATE_BOOLEAN);
 	if ($apcuOn) {
@@ -873,7 +1017,7 @@ if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') !== __FILE__) {
 }
 
 // Reduce potential long-blocking DNS calls, but allow more time for first run
-@ini_set('default_socket_timeout', '3');
+@ini_set('default_socket_timeout', (string)max(1, (int)ceil(get_dns_timeout_ms() / 1000)));
 @set_time_limit(30);
 
 $wantsJson = detect_wants_json();
