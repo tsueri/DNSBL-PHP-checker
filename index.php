@@ -208,6 +208,70 @@ function get_forced_resolver(): ?string {
 	return null;
 }
 
+// -------------------- Resolver seam --------------------
+// All DNS access goes through DnsResolver: dig when a resolver is forced,
+// the native resolver otherwise, and an in-memory adapter in tests.
+interface DnsResolver {
+	/** @return list<string> record values; empty when there is no record or the query failed */
+	public function query(string $name, int $type): array;
+}
+
+final class NativeResolver implements DnsResolver {
+	public function query(string $name, int $type): array {
+		$recs = @dns_get_record($name, $type);
+		if (!is_array($recs)) return [];
+		$out = [];
+		foreach ($recs as $rec) {
+			if ($type === DNS_A && !empty($rec['ip'])) $out[] = (string)$rec['ip'];
+			elseif ($type === DNS_AAAA && !empty($rec['ipv6'])) $out[] = (string)$rec['ipv6'];
+			elseif ($type === DNS_TXT && !empty($rec['txt'])) $out[] = (string)$rec['txt'];
+		}
+		return $out;
+	}
+}
+
+final class DigResolver implements DnsResolver {
+	public function __construct(private string $server) {}
+
+	public function query(string $name, int $type): array {
+		if (!is_shell_exec_available()) return [];
+		if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $this->server)) return [];
+		$typeArg = match ($type) {
+			DNS_A => 'A',
+			DNS_AAAA => 'AAAA',
+			DNS_TXT => 'TXT',
+			default => null,
+		};
+		if ($typeArg === null) return [];
+		$cmd = "dig +time=3 +tries=1 +retry=0 +short @{$this->server} " . escapeshellarg($name) . " {$typeArg} 2>/dev/null";
+		$out = @shell_exec($cmd);
+		if (!is_string($out)) return [];
+		$lines = preg_split('/\r?\n/', trim($out));
+		if ($lines === false) return [];
+		$records = [];
+		foreach ($lines as $line) {
+			if ($type === DNS_TXT) {
+				$line = trim($line);
+				if ($line === '') continue;
+				$line = preg_replace('/^"|"$/', '', $line) ?? $line;
+				$line = str_replace('" "', ' ', $line);
+				$line = trim($line, '"');
+				if ($line !== '') $records[] = $line;
+				continue;
+			}
+			$line = trim($line, '" \t\r\n');
+			if ($line === '') continue;
+			if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6)) $records[] = $line;
+		}
+		return $records;
+	}
+}
+
+function dns_resolver(): DnsResolver {
+	$server = get_forced_resolver();
+	return $server !== null ? new DigResolver($server) : new NativeResolver();
+}
+
 function dnsbl_query_name(string $ip, string $zone): ?string {
 	$zone = rtrim($zone, '.');
 	if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
@@ -224,116 +288,44 @@ function dnsbl_query_name(string $ip, string $zone): ?string {
 	return null;
 }
 
-function resolve_domain_ips(string $domain): array {
+function resolve_domain_ips(DnsResolver $dns, string $domain): array {
 	$out = ['ipv4' => [], 'ipv6' => []];
 	$ascii = to_ascii_domain($domain);
 	if ($ascii === null) return $out;
-	$a = @dns_get_record($ascii, DNS_A);
-	if (is_array($a)) {
-		foreach ($a as $rec) if (!empty($rec['ip'])) $out['ipv4'][] = $rec['ip'];
-	}
-	$aaaa = @dns_get_record($ascii, DNS_AAAA);
-	if (is_array($aaaa)) {
-		foreach ($aaaa as $rec) if (!empty($rec['ipv6'])) $out['ipv6'][] = $rec['ipv6'];
-	}
+	foreach ($dns->query($ascii, DNS_A) as $ip) $out['ipv4'][] = $ip;
+	foreach ($dns->query($ascii, DNS_AAAA) as $ip) $out['ipv6'][] = $ip;
 	$out['ipv4'] = array_values(array_unique($out['ipv4']));
 	$out['ipv6'] = array_values(array_unique($out['ipv6']));
 	return $out;
 }
 
-function dig_lookup_a_txt(string $qname, string $server): array {
-	if (!is_shell_exec_available()) return [null, null];
-	if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $server)) return [null, null];
-	$serverArg = '@' . $server;
-	$qArg = escapeshellarg($qname);
-	$cmdA = "dig +time=3 +tries=1 +retry=0 +short $serverArg $qArg A 2>/dev/null";
-	$outA = @shell_exec($cmdA);
-	$aIp = null;
-	if (is_string($outA)) {
-		foreach (preg_split('/\r?\n/', trim($outA)) as $line) {
-			$line = trim($line, '" \t\r\n');
-			if ($line === '') continue;
-			if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6)) { $aIp = $line; break; }
-		}
-	}
-	$cmdT = "dig +time=3 +tries=1 +retry=0 +short $serverArg $qArg TXT 2>/dev/null";
-	$outT = @shell_exec($cmdT);
-	$txt = null;
-	if (is_string($outT) && trim($outT) !== '') {
-		$parts = [];
-		foreach (preg_split('/\r?\n/', trim($outT)) as $line) {
-			$line = trim($line);
-			$line = preg_replace('/^\"|\"$/', '', $line);
-			$line = str_replace('" "', ' ', $line);
-			$line = trim($line, '"');
-			if ($line !== '') $parts[] = $line;
-		}
-		if ($parts) $txt = implode(' | ', $parts);
-	}
-	return [$aIp, $txt];
-}
-
-function check_dnsbl(string $ip, string $zoneEff): array {
+function check_dnsbl(DnsResolver $dns, string $ip, string $zoneEff): array {
 	$qname = dnsbl_query_name($ip, $zoneEff);
 	if ($qname === null) return ['listed'=>false,'response'=>null,'txt'=>null,'query'=>'','error'=>'bad_qname','a_ms'=>0,'txt_ms'=>0,'total_ms'=>0];
 	$qDisp = redact_dqs_in_query($qname);
-	$server = get_forced_resolver();
 	$aStart = microtime(true);
-	$aIp = null; $txt = null; $aMs = 0; $tMs = 0; $timeout = false;
-	if ($server) {
-		[$aIp, $txt] = dig_lookup_a_txt($qname, $server);
-		$aMs = (int) round((microtime(true) - $aStart) * 1000);
-		// dig_lookup returns both; we count total as a_ms when txt included
-		if ($aIp !== null && $txt === null) {
-			// fetch TXT separately if listed
-			$ts = microtime(true);
-			[$dummy, $txt2] = dig_lookup_a_txt($qname, $server);
-			$tMs = (int) round((microtime(true) - $ts) * 1000);
-			if ($txt2 !== null) $txt = $txt2;
-		}
-		// Timeout heuristic for forced resolver path: no data and near timeout budget
-		if ($aIp === null && $txt === null && $aMs >= 3000) {
-			$timeout = true;
-		}
-	} else {
-		$recs = @dns_get_record($qname, DNS_A);
-		if (is_array($recs) && $recs) {
-			foreach ($recs as $rec) {
-				if (!empty($rec['ip']) && filter_var($rec['ip'], FILTER_VALIDATE_IP)) { $aIp = $rec['ip']; break; }
-			}
-		}
-		$aMs = (int) round((microtime(true) - $aStart) * 1000);
-		if ($aIp === null && $aMs >= 3000) {
-			$timeout = true;
-		}
-		if ($aIp !== null) {
-			$ts = microtime(true);
-			$txtRecs = @dns_get_record($qname, DNS_TXT);
-			if (is_array($txtRecs)) {
-				$parts = [];
-				foreach ($txtRecs as $rec) {
-					if (!empty($rec['txt'])) $parts[] = (string)$rec['txt'];
-				}
-				if ($parts) $txt = implode(' | ', $parts);
-			}
-			$tMs = (int) round((microtime(true) - $ts) * 1000);
-		}
-	}
-	$total = $aMs + $tMs;
-	$err = null;
-	if ($timeout) {
-		$err = 'timeout';
-		if ($txt === null) { $txt = 'Timeout after 3s'; }
+	$aRecords = $dns->query($qname, DNS_A);
+	$aMs = (int) round((microtime(true) - $aStart) * 1000);
+	$aIp = $aRecords[0] ?? null;
+	$txt = null;
+	$tMs = 0;
+	$timeout = ($aIp === null && $aMs >= 3000);
+	if ($timeout) $txt = 'Timeout after 3s';
+	if ($aIp !== null) {
+		$ts = microtime(true);
+		$txtRecords = $dns->query($qname, DNS_TXT);
+		$tMs = (int) round((microtime(true) - $ts) * 1000);
+		if ($txtRecords) $txt = implode(' | ', $txtRecords);
 	}
 	return [
 		'listed' => $aIp !== null,
 		'response' => $aIp,
 		'txt' => $txt,
 		'query' => $qDisp,
-		'error' => $err,
+		'error' => $timeout ? 'timeout' : null,
 		'a_ms' => $aMs,
 		'txt_ms' => $tMs,
-		'total_ms' => $total,
+		'total_ms' => $aMs + $tMs,
 	];
 }
 
@@ -426,20 +418,6 @@ function results_completeness(array $results, array $zones, array $ipsByFam): ar
 		'actual' => $actual,
 		'complete' => ($expected === $actual),
 	];
-}
-
-// Backfill any missing IP×zone entries sequentially to ensure completeness
-function fill_missing_results(array $results, array $zonesDisplay, array $ipsByFam): array {
-	foreach (['ipv4','ipv6'] as $fam) {
-		foreach (($ipsByFam[$fam] ?? []) as $ip) {
-			foreach ($zonesDisplay as $zoneDisplay) {
-				if (isset($results[$ip][$zoneDisplay])) continue;
-				$zoneEff = map_zone_for_query($zoneDisplay);
-				$results[$ip][$zoneDisplay] = check_dnsbl($ip, $zoneEff);
-			}
-		}
-	}
-	return $results;
 }
 
 // -------------------- Rate limiting (per client IP) --------------------
@@ -822,6 +800,11 @@ function is_rate_limit_allowlisted(string $ip): bool {
 }
 
 // -------------------- Controller --------------------
+// Skip when included (e.g. by tests); only run when this file is the entry point.
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') !== __FILE__) {
+	return;
+}
+
 // Reduce potential long-blocking DNS calls, but allow more time for first run
 @ini_set('default_socket_timeout', '3');
 @set_time_limit(30);
@@ -864,6 +847,8 @@ $resolved = [
 // Enforce rate limit only when a lookup is attempted
 enforce_rate_limit($wantsJson, $queryInput !== '');
 
+$dns = dns_resolver();
+
 if ($queryInput !== '') {
 		if (is_valid_ip($queryInput)) {
 				$resolved['input_type'] = strpos($queryInput, ':') !== false ? 'ipv6' : 'ipv4';
@@ -871,7 +856,7 @@ if ($queryInput !== '') {
 				else $resolved['ips']['ipv6'][] = $queryInput;
 		} elseif (is_valid_domain($queryInput)) {
 				$resolved['input_type'] = 'domain';
-				$ips = resolve_domain_ips($queryInput);
+				$ips = resolve_domain_ips($dns, $queryInput);
 				$resolved['ips']['ipv4'] = $ips['ipv4'] ?? [];
 				$resolved['ips']['ipv6'] = $ips['ipv6'] ?? [];
 				if (!$resolved['ips']['ipv4'] && !$resolved['ips']['ipv6']) {
@@ -888,7 +873,7 @@ if ($queryInput !== '' && !$errors) {
 		foreach ($resolved['ips'][$fam] as $ip) {
 			foreach ($zones as $zoneDisplay) {
 				$zoneEff = map_zone_for_query($zoneDisplay);
-				$results[$ip][$zoneDisplay] = check_dnsbl($ip, $zoneEff);
+				$results[$ip][$zoneDisplay] = check_dnsbl($dns, $ip, $zoneEff);
 			}
 		}
 	}

@@ -24,6 +24,12 @@ php -S localhost:8000
 
  
 
+## Tests
+Run the resolver/check tests directly with PHP (no dependencies):
+```bash
+php tests/dnsbl_check_test.php
+```
+
 ## Usage
 - Web UI: open `/?lookup=8.8.8.8`
 - GET API (JSON): `/?lookup=8.8.8.8&format=json`
