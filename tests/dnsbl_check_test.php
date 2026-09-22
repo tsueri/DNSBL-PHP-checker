@@ -15,6 +15,7 @@ final class InMemoryResolver implements DnsResolver {
 	/** @var list<array{name: string, type: int}> */
 	public array $calls = [];
 	public int $aDelayMicros = 0;
+	public string $status = 'ok';
 
 	/** @param list<string> $values */
 	public function set(string $name, int $type, array $values): void {
@@ -26,7 +27,10 @@ final class InMemoryResolver implements DnsResolver {
 		if ($type === DNS_A && $this->aDelayMicros > 0) {
 			usleep($this->aDelayMicros);
 		}
-		return $this->answers[$name][$type] ?? [];
+		return [
+			'records' => $this->answers[$name][$type] ?? [],
+			'status' => $type === DNS_A ? $this->status : 'ok',
+		];
 	}
 
 	/** @return list<string> */
@@ -113,11 +117,88 @@ assert_same('invalid ip reports bad_qname', 'bad_qname', $check['error']);
 assert_same('invalid ip makes no query', [], $dns->calls);
 
 $dns = new InMemoryResolver();
+$dns->status = 'timeout';
 $dns->aDelayMicros = 3_100_000;
 $check = check_dnsbl($dns, '1.2.3.4', 'zen.spamhaus.org');
 assert_same('slow unanswered check reports timeout', 'timeout', $check['error']);
-assert_same('timeout explains itself in txt', 'Timeout after 3s', $check['txt']);
+assert_same('timeout explains itself in txt', 'No DNS answer (timeout or unreachable resolver)', $check['txt']);
 assert_same('timed out check is not listed', false, $check['listed']);
+assert_same('timed out check does not query TXT', 0, count($dns->queryNamesOfType(DNS_TXT)));
+
+$dns = new InMemoryResolver();
+$dns->status = 'error';
+$check = check_dnsbl($dns, '1.2.3.4', 'zen.spamhaus.org');
+assert_same('resolver failure reports dns_error', 'dns_error', $check['error']);
+assert_same('resolver failure reports its own txt', 'DNS query failed', $check['txt']);
+assert_same('failed check is not listed', false, $check['listed']);
+
+// --- Return-code classification ---
+assert_same(
+	'127.0.0.2 is a listing',
+	['listed' => true, 'error' => null, 'message' => null],
+	classify_dnsbl_response('127.0.0.2')
+);
+assert_same(
+	'127.255.255.254 is a resolver error, not a listing',
+	['listed' => false, 'error' => 'dnsbl_error', 'message' => 'DNSBL refuses queries from this resolver (public/open resolver?)'],
+	classify_dnsbl_response('127.255.255.254')
+);
+assert_same(
+	'127.255.255.252 reports the zone-name typo code',
+	'DNSBL rejected the query name (zone name typo?)',
+	classify_dnsbl_response('127.255.255.252')['message']
+);
+assert_same(
+	'127.255.255.255 reports the query-limit code',
+	'DNSBL query limit exceeded',
+	classify_dnsbl_response('127.255.255.255')['message']
+);
+assert_same(
+	'non-loopback answers are not listings',
+	['listed' => false, 'error' => 'unexpected_response', 'message' => 'Unexpected DNSBL answer (resolver hijacking?)'],
+	classify_dnsbl_response('93.184.216.34')
+);
+assert_same(
+	'no answer is neither listed nor an error',
+	['listed' => false, 'error' => null, 'message' => null],
+	classify_dnsbl_response(null)
+);
+
+$dns = new InMemoryResolver();
+$dns->set('4.3.2.1.zen.spamhaus.org', DNS_A, ['127.255.255.254']);
+$dns->set('4.3.2.1.zen.spamhaus.org', DNS_TXT, ['Error: open resolver; https://check.spamhaus.org/returnc/pub/']);
+$check = check_dnsbl($dns, '1.2.3.4', 'zen.spamhaus.org');
+assert_same('spamhaus open-resolver code is not listed', false, $check['listed']);
+assert_same('spamhaus open-resolver code keeps the response for display', '127.255.255.254', $check['response']);
+assert_same('spamhaus open-resolver code reports dnsbl_error', 'dnsbl_error', $check['error']);
+assert_same('error codes still surface the zone TXT', 'Error: open resolver; https://check.spamhaus.org/returnc/pub/', $check['txt']);
+
+$dns = new InMemoryResolver();
+$dns->set('4.3.2.1.zen.spamhaus.org', DNS_A, ['93.184.216.34']);
+$check = check_dnsbl($dns, '1.2.3.4', 'zen.spamhaus.org');
+assert_same('hijacked answer is not listed', false, $check['listed']);
+assert_same('hijacked answer reports unexpected_response', 'unexpected_response', $check['error']);
+
+// --- Result summary keeps unknown apart from clean ---
+$results = [
+	'1.2.3.4' => [
+		'zone-a' => ['listed' => false, 'error' => 'timeout'],
+		'zone-b' => ['listed' => false, 'error' => null],
+	],
+	'5.6.7.8' => [
+		'zone-a' => ['listed' => true, 'error' => null],
+		'zone-b' => ['listed' => false, 'error' => 'dnsbl_error'],
+	],
+	'9.9.9.9' => [
+		'zone-a' => ['listed' => false, 'error' => null],
+		'zone-b' => ['listed' => false, 'error' => null],
+	],
+];
+$summary = build_results_summary($results, ['zone-a', 'zone-b']);
+assert_same('summary counts error checks', 2, $summary['total_errors']);
+assert_same('summary counts listings', 1, $summary['total_listed']);
+assert_same('IP with an error and no listing is unknown', ['1.2.3.4'], $summary['unknown_ips']);
+assert_same('only fully answered non-listed IPs are clean', ['9.9.9.9'], $summary['clean_ips']);
 
 // --- Summary ---
 echo "\n{$GLOBALS['__checks']} checks, {$GLOBALS['__failures']} failures\n";

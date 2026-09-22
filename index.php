@@ -211,22 +211,24 @@ function get_forced_resolver(): ?string {
 // -------------------- Resolver seam --------------------
 // All DNS access goes through DnsResolver: dig when a resolver is forced,
 // the native resolver otherwise, and an in-memory adapter in tests.
+// A query answers with records plus a status: 'ok' also covers NXDOMAIN
+// (empty records), while 'timeout'/'error' mean the resolver gave no answer.
 interface DnsResolver {
-	/** @return list<string> record values; empty when there is no record or the query failed */
+	/** @return array{records: list<string>, status: 'ok'|'timeout'|'error'} */
 	public function query(string $name, int $type): array;
 }
 
 final class NativeResolver implements DnsResolver {
 	public function query(string $name, int $type): array {
 		$recs = @dns_get_record($name, $type);
-		if (!is_array($recs)) return [];
+		if (!is_array($recs)) return ['records' => [], 'status' => 'error'];
 		$out = [];
 		foreach ($recs as $rec) {
 			if ($type === DNS_A && !empty($rec['ip'])) $out[] = (string)$rec['ip'];
 			elseif ($type === DNS_AAAA && !empty($rec['ipv6'])) $out[] = (string)$rec['ipv6'];
 			elseif ($type === DNS_TXT && !empty($rec['txt'])) $out[] = (string)$rec['txt'];
 		}
-		return $out;
+		return ['records' => $out, 'status' => 'ok'];
 	}
 }
 
@@ -234,20 +236,30 @@ final class DigResolver implements DnsResolver {
 	public function __construct(private string $server) {}
 
 	public function query(string $name, int $type): array {
-		if (!is_shell_exec_available()) return [];
-		if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $this->server)) return [];
+		$failure = ['records' => [], 'status' => 'error'];
+		if (!is_shell_exec_available()) return $failure;
+		if (!preg_match('/^[A-Za-z0-9:\\.-]+$/', $this->server)) return $failure;
 		$typeArg = match ($type) {
 			DNS_A => 'A',
 			DNS_AAAA => 'AAAA',
 			DNS_TXT => 'TXT',
 			default => null,
 		};
-		if ($typeArg === null) return [];
-		$cmd = "dig +time=3 +tries=1 +retry=0 +short @{$this->server} " . escapeshellarg($name) . " {$typeArg} 2>/dev/null";
+		if ($typeArg === null) return $failure;
+		// Append dig's exit status: 0 = answer (incl. NXDOMAIN), 9 = no answer,
+		// anything else = local failure. This separates "not listed" from "unknown".
+		$cmd = "dig +time=3 +tries=1 +retry=0 +short @{$this->server} " . escapeshellarg($name) . " {$typeArg} 2>/dev/null; printf '\\n__dig_status:%d' $?";
 		$out = @shell_exec($cmd);
-		if (!is_string($out)) return [];
+		if (!is_string($out)) return $failure;
+		$status = 'ok';
+		if (preg_match('/__dig_status:(\d+)\s*$/', $out, $m)) {
+			$out = (string)preg_replace('/\n?__dig_status:\d+\s*$/', '', $out);
+			$code = (int)$m[1];
+			if ($code === 9) $status = 'timeout';
+			elseif ($code !== 0) $status = 'error';
+		}
 		$lines = preg_split('/\r?\n/', trim($out));
-		if ($lines === false) return [];
+		if ($lines === false) return $failure;
 		$records = [];
 		foreach ($lines as $line) {
 			if ($type === DNS_TXT) {
@@ -263,7 +275,7 @@ final class DigResolver implements DnsResolver {
 			if ($line === '') continue;
 			if (filter_var($line, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6)) $records[] = $line;
 		}
-		return $records;
+		return ['records' => $records, 'status' => $status];
 	}
 }
 
@@ -292,11 +304,46 @@ function resolve_domain_ips(DnsResolver $dns, string $domain): array {
 	$out = ['ipv4' => [], 'ipv6' => []];
 	$ascii = to_ascii_domain($domain);
 	if ($ascii === null) return $out;
-	foreach ($dns->query($ascii, DNS_A) as $ip) $out['ipv4'][] = $ip;
-	foreach ($dns->query($ascii, DNS_AAAA) as $ip) $out['ipv6'][] = $ip;
+	foreach ($dns->query($ascii, DNS_A)['records'] as $ip) $out['ipv4'][] = $ip;
+	foreach ($dns->query($ascii, DNS_AAAA)['records'] as $ip) $out['ipv6'][] = $ip;
 	$out['ipv4'] = array_values(array_unique($out['ipv4']));
 	$out['ipv6'] = array_values(array_unique($out['ipv6']));
 	return $out;
+}
+
+/**
+ * Classify the A record a zone returned for a query name.
+ * DNSBL listings use 127.0.0.0/8. Spamhaus uses 127.255.255.0/24 for error
+ * codes that must not be read as a listing. Any other address is not a DNSBL
+ * answer (e.g. a hijacking resolver) and is treated as an error as well.
+ *
+ * @return array{listed: bool, error: ?string, message: ?string}
+ */
+function classify_dnsbl_response(?string $ip): array {
+	if ($ip === null) return ['listed' => false, 'error' => null, 'message' => null];
+	if (str_starts_with($ip, '127.255.255.')) {
+		$code = (int)substr($ip, 12);
+		$message = match ($code) {
+			252 => 'DNSBL rejected the query name (zone name typo?)',
+			254 => 'DNSBL refuses queries from this resolver (public/open resolver?)',
+			255 => 'DNSBL query limit exceeded',
+			default => 'DNSBL returned an error code',
+		};
+		return ['listed' => false, 'error' => 'dnsbl_error', 'message' => $message];
+	}
+	if (str_starts_with($ip, '127.')) return ['listed' => true, 'error' => null, 'message' => null];
+	return ['listed' => false, 'error' => 'unexpected_response', 'message' => 'Unexpected DNSBL answer (resolver hijacking?)'];
+}
+
+function dnsbl_error_label(string $error): string {
+	return match ($error) {
+		'timeout' => 'timeout',
+		'dns_error' => 'DNS failure',
+		'dnsbl_error' => 'DNSBL error code',
+		'unexpected_response' => 'unexpected response',
+		'bad_qname' => 'bad query name',
+		default => 'error',
+	};
 }
 
 function check_dnsbl(DnsResolver $dns, string $ip, string $zoneEff): array {
@@ -304,25 +351,35 @@ function check_dnsbl(DnsResolver $dns, string $ip, string $zoneEff): array {
 	if ($qname === null) return ['listed'=>false,'response'=>null,'txt'=>null,'query'=>'','error'=>'bad_qname','a_ms'=>0,'txt_ms'=>0,'total_ms'=>0];
 	$qDisp = redact_dqs_in_query($qname);
 	$aStart = microtime(true);
-	$aRecords = $dns->query($qname, DNS_A);
+	$answer = $dns->query($qname, DNS_A);
 	$aMs = (int) round((microtime(true) - $aStart) * 1000);
-	$aIp = $aRecords[0] ?? null;
+	$aIp = $answer['records'][0] ?? null;
+	$classification = classify_dnsbl_response($aIp);
+	$listed = ($answer['status'] === 'ok') && $classification['listed'];
 	$txt = null;
 	$tMs = 0;
-	$timeout = ($aIp === null && $aMs >= 3000);
-	if ($timeout) $txt = 'Timeout after 3s';
+	if ($answer['status'] === 'timeout') {
+		$error = 'timeout';
+		$txt = 'No DNS answer (timeout or unreachable resolver)';
+	} elseif ($answer['status'] === 'error') {
+		$error = 'dns_error';
+		$txt = 'DNS query failed';
+	} else {
+		$error = $classification['error'];
+		$txt = $classification['message'];
+	}
 	if ($aIp !== null) {
 		$ts = microtime(true);
-		$txtRecords = $dns->query($qname, DNS_TXT);
+		$txtAnswer = $dns->query($qname, DNS_TXT);
 		$tMs = (int) round((microtime(true) - $ts) * 1000);
-		if ($txtRecords) $txt = implode(' | ', $txtRecords);
+		if ($txtAnswer['records']) $txt = implode(' | ', $txtAnswer['records']);
 	}
 	return [
-		'listed' => $aIp !== null,
+		'listed' => $listed,
 		'response' => $aIp,
 		'txt' => $txt,
 		'query' => $qDisp,
-		'error' => $timeout ? 'timeout' : null,
+		'error' => $error,
 		'a_ms' => $aMs,
 		'txt_ms' => $tMs,
 		'total_ms' => $aMs + $tMs,
@@ -358,8 +415,10 @@ function build_results_summary(array $results, array $zones): array {
 	$totalZones = count($zones);
 	$totalChecks = $totalIps * $totalZones;
 	$totalListed = 0;
+	$totalErrors = 0;
 	$listedIps = [];
 	$cleanIps = [];
+	$unknownIps = [];
 	$listedByIp = [];
 	$listedByZone = [];
 	foreach ($zones as $z) {
@@ -368,6 +427,7 @@ function build_results_summary(array $results, array $zones): array {
 
 	foreach ($results as $ip => $zoneRes) {
 		$ipZones = [];
+		$ipErrors = 0;
 		foreach ($zones as $z) {
 			if (!isset($zoneRes[$z])) continue;
 			$entry = $zoneRes[$z];
@@ -376,11 +436,16 @@ function build_results_summary(array $results, array $zones): array {
 				$ipZones[] = $z;
 				$listedByZone[$z]['count']++;
 				$listedByZone[$z]['ips'][] = $ip;
+			} elseif (!empty($entry['error'])) {
+				$totalErrors++;
+				$ipErrors++;
 			}
 		}
 		if ($ipZones) {
 			$listedIps[] = $ip;
 			$listedByIp[$ip] = ['count' => count($ipZones), 'zones' => $ipZones];
+		} elseif ($ipErrors > 0) {
+			$unknownIps[] = $ip;
 		} else {
 			$cleanIps[] = $ip;
 		}
@@ -397,9 +462,11 @@ function build_results_summary(array $results, array $zones): array {
 		'total_zones' => $totalZones,
 		'total_checks' => $totalChecks,
 		'total_listed' => $totalListed,
+		'total_errors' => $totalErrors,
 		'any_listed' => $totalListed > 0,
 		'listed_ips' => array_values(array_unique($listedIps)),
 		'clean_ips' => array_values($cleanIps),
+		'unknown_ips' => array_values(array_unique($unknownIps)),
 		'listed_by_ip' => $listedByIp,
 		'listed_by_zone' => $listedByZone,
 	];
@@ -1051,8 +1118,8 @@ send_security_headers(false);
 						<strong>Status legend:</strong>
 						<span class="ms-2 result-listed">LISTED</span>
 						<span class="ms-2 result-clean">not listed</span>
-						<span class="ms-2 text-warning fw-semibold">unknown (timeout)</span>
-						<span class="ms-1">= DNSBL query timed out (~3s).</span>
+						<span class="ms-2 text-warning fw-semibold">unknown</span>
+						<span class="ms-1">= no DNS answer, or the zone returned an error code instead of a listing (see Return/TXT).</span>
 					</div>
 					<?php foreach ($results as $ip => $zonesResults): ?>
 						<div class="card mb-4 shadow-sm">
@@ -1062,10 +1129,14 @@ send_security_headers(false);
 								</div>
 								<?php
 									$anyListed = false;
-									foreach ($zonesResults as $zr) { if ($zr['listed']) { $anyListed = true; break; } }
+									$anyError = false;
+									foreach ($zonesResults as $zr) {
+										if (!empty($zr['listed'])) { $anyListed = true; }
+										elseif (!empty($zr['error'])) { $anyError = true; }
+									}
 								?>
-								<span class="badge <?= $anyListed ? 'bg-danger' : 'bg-success' ?>">
-									<?= $anyListed ? 'Listed' : 'Not Listed' ?>
+								<span class="badge <?= $anyListed ? 'bg-danger' : ($anyError ? 'bg-warning text-dark' : 'bg-success') ?>">
+									<?= $anyListed ? 'Listed' : ($anyError ? 'Unknown' : 'Not Listed') ?>
 								</span>
 							</div>
 							<div class="table-responsive">
@@ -1086,8 +1157,8 @@ send_security_headers(false);
 											<?php $qv = $out['query'] ?? ''; if (is_array($qv)) { $qv = implode(' ', array_map('strval', $qv)); } else { $qv = (string)$qv; } ?>
 											<td class="text-muted small"><span class="dnsbl-zone"><?= h($qv) ?></span></td>
 											<td>
-												<?php if (!empty($out['error']) && $out['error'] === 'timeout'): ?>
-													<span class="text-warning fw-semibold">unknown (timeout)</span>
+												<?php if (!empty($out['error'])): ?>
+													<span class="text-warning fw-semibold">unknown (<?= h(dnsbl_error_label((string)$out['error'])) ?>)</span>
 												<?php elseif ($out['listed']): ?>
 													<span class="result-listed">LISTED</span>
 												<?php else: ?>

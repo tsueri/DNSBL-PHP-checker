@@ -119,6 +119,7 @@ Response (example):
 
 ## Spamhaus Notes
 - Spamhaus blocks DNSBL queries over public/open resolvers. Use a closed local resolver (preferred) and/or DQS.
+- Spamhaus keeps listings in `127.0.0.0/8` and errors in `127.255.255.0/24` (`252` zone-name typo, `254` query via public/open resolver, `255` query limit). Errors are never displayed as LISTED; they show as `unknown (DNSBL error code)` with the zone TXT when available. Zones that hijack NXDOMAIN answers (returning an A record for everything) are reported as `unknown (unexpected response)`.
 - DQS setup:
   - Get a key from Spamhaus DQS
   - Configure `SPAMHAUS_DQS_KEY` in `config.php` or as an env var
@@ -160,9 +161,11 @@ curl -s "http://localhost:8000/?lookup=8.8.8.8&dnsbl[]=zen.spamhaus.org&dnsbl[]=
     "total_zones": 2,
     "total_checks": 2,
     "total_listed": 0,
+    "total_errors": 0,
     "any_listed": false,
     "listed_ips": [],
     "clean_ips": ["8.8.8.8"],
+    "unknown_ips": [],
     "listed_by_ip": {},
     "listed_by_zone": { "zen.spamhaus.org": {"count": 0, "ips": []}, "dnsbl.sorbs.net": {"count": 0, "ips": []} }
   },
@@ -187,6 +190,7 @@ curl -s "http://localhost:8000/?lookup=8.8.8.8&dnsbl[]=zen.spamhaus.org&dnsbl[]=
 ## Notes
 - Some DNSBL providers (e.g., Barracuda) may require registration and will return NXDOMAIN/empty answers until allowed.
 - For best results, run with a local recursive resolver or DQS when using Spamhaus zones.
+- Per-check `error` values: `timeout` / `dns_error` mean no answer arrived, `dnsbl_error` means the zone returned an error return code, `unexpected_response` means the answer was not a DNSBL address (e.g. hijacking resolver). These checks are `unknown` — neither listed nor clean — and are counted in `summary.total_errors`.
 
 ## Troubleshooting
 - Verify the running build header:
